@@ -17,7 +17,55 @@
     <img src="https://img.shields.io/badge/follow-@lbugdb-1DA1F2?logo=twitter" alt="twitter"></a>
 </p>
 
-# Ladybug
+# Ladybug, fast-load fork
+
+A fork of [Ladybug](https://github.com/LadybugDB/ladybug) (formerly [Kuzu](https://github.com/kuzudb/kuzu)) optimized for
+**building, extending and editing very large graphs inside one process with bounded memory**: hundreds of millions to
+billions of relationships on a single machine, without running a server. Query behaviour and the Cypher dialect are
+unchanged; everything upstream offers still works.
+
+| | Upstream Ladybug | This fork |
+|---|---|---|
+| Load 330M relationships, 8 GB buffer pool | fails after 28 min ("Buffer pool is full", 16.7 GB RSS) | ~7 min, 8 GB RSS |
+| Extend that table by 33M relationships | 321 s | 205 s |
+| Delete ~3.3M relationships by predicate (skewed in-degree) | 1,559 s | 421 s |
+| Full-text search and graph algorithms offline | need `INSTALL` from the network; `LOAD algo` fails on Linux | linked in, no download |
+| `import kuzu` and `import ladybug` in one process | import error, then crash at exit | works |
+
+Measured on a synthetic transaction graph (11.8M nodes, 330M relationships with super-nodes) on 16 vCPU / 24 GB.
+The upstream column is the same source tree without this fork's commits; since upstream cannot load this table, its
+extend and delete numbers are measured with only the bucketed load applied.
+
+## What changed
+
+- **Bucketed relationship COPY.** Two COPY options, `DIRECTION='fwd'|'bwd'` (build one direction's CSR) and
+  `RAW_OFFSETS=true` (take source, destination and relationship offsets from the input instead of looking up keys),
+  plus a COPY that leaves untouched node groups alone. A loader can then copy one node-group-aligned bucket at a time,
+  so memory is bounded by the bucket, not the table. See [`scripts/bucketed_load`](scripts/bucketed_load).
+- **Faster extend.** A COPY into populated node groups is merged at checkpoint in contiguous runs instead of row by row,
+  and the columns of a node group are rewritten in parallel.
+- **Faster bulk delete and update.** Long relationship lists are scanned once per transaction instead of once per
+  deleted or updated relationship.
+- **Bundled extensions.** `make python-bundled` links `fts` and `algo` (PAGE_RANK, WCC, SCC, LOUVAIN, K_CORE) into the
+  Python module.
+- **Coexists with Kuzu.** Module-local bindings, `-Bsymbolic`, and a local load of the native module.
+
+## Build
+
+```bash
+git clone --recurse-submodules https://github.com/Seragonia/ladybug
+cd ladybug && make python-bundled
+export PYTHONPATH=$PWD/tools/python_api/build
+```
+
+Experimental: correctness is checked by the tests in [`scripts/bucketed_load`](scripts/bucketed_load) (bucketed load,
+extend, deletes and updates compared against a stock COPY and against DuckDB), not by a full run of upstream's suite.
+
+---
+
+## Upstream README
+
+## Ladybug
 Ladybug is an embedded graph database built for query speed and scalability. Ladybug is optimized for handling complex analytical workloads
 on very large databases and provides a set of retrieval features, such as a full text search and vector indices. Our core feature set includes:
 
