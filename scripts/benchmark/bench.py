@@ -37,7 +37,7 @@ def timed(name, fn):
 
 
 def copy_rels(conn, rel, src, dst, file, props, where=None):
-    edges = f"'{data}/{file}'" if where is None else f"(SELECT * FROM '{data}/{file}' WHERE {where})"
+    edges = f"'{data}/{file}'"
     flt = "" if where is None else f" WHERE {where}"
     rows = conn.execute(f"LOAD FROM '{data}/{file}'{flt} RETURN count(*)").get_next()[0]
     # Buckets bound memory but cost a key-resolution pass: like an application would, the fork buckets only above
@@ -46,7 +46,7 @@ def copy_rels(conn, rel, src, dst, file, props, where=None):
         from bucketed_load import bucketed_copy
 
         bucketed_copy(conn, rel, src, "id", dst, "id", edges, "src", "dst", props, db_path + ".work",
-                      edges_per_bucket=EDGES_PER_BUCKET, duck_mem=DUCKDB_MEMORY, log=lambda *a: None)
+                      edges_per_bucket=EDGES_PER_BUCKET, duck_mem=DUCKDB_MEMORY, where=where, log=lambda *a: None)
     elif where is None:
         conn.execute(f"COPY {rel} FROM '{data}/{file}'")
     else:
