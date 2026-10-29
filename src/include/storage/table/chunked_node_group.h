@@ -169,6 +169,7 @@ public:
     // Shared with a scan that started before a checkpoint. reset() on this group drops only
     // this reference.
     std::shared_ptr<VersionInfo> getVersionInfo() const { return versionInfo; }
+    const VersionInfo* getVersionInfoPtr() const { return versionInfo.get(); }
     // Moves out the group's version info, leaving it null. Used to preserve uncheckpointed
     // deletes when restoring persistent chunks after a failed checkpoint (see #1051); the
     // checkpoint reads version info but only resets it on success, so the live object still

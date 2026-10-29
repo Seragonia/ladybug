@@ -1381,17 +1381,25 @@ static void writeCSRListNoPersistentDeletions(CheckpointReadCursor& readCursor,
 
 static void writeCSRListWithPersistentDeletions(const Transaction* transaction,
     CheckpointReadCursor& readCursor, CheckpointWriteCursor& writeCursor, offset_t oldCSRLength,
-    const ChunkedNodeGroup& persistentChunkGroup) {
-    // TODO(Guodong): Optimize the for loop away by appending in batch
-    for (auto i = 0u; i < oldCSRLength; i++) {
-        if (!persistentChunkGroup.isDeleted(transaction, readCursor.getCSROffset())) {
-            if (!canSkipWrite(readCursor, writeCursor)) {
-                auto [segmentData, offsetInSegment] = readCursor.getDataToRead();
-                writeCursor.appendToCurrentSegment(segmentData, offsetInSegment, 1);
-            }
-            ++writeCursor;
+    const ChunkedNodeGroup& persistentChunkGroup, std::vector<row_idx_t>& deletedRows) {
+    // Copy the runs of rows between deleted ones as lists without deletions: row by row, a bulk
+    // delete spread over the whole table had every row of it copied one at a time.
+    const auto startRow = readCursor.getCSROffset();
+    deletedRows.clear();
+    if (const auto* versionInfo = persistentChunkGroup.getVersionInfoPtr()) {
+        versionInfo->getDeletedRows(transaction, startRow, oldCSRLength, deletedRows);
+    }
+    auto nextRow = startRow;
+    for (const auto deletedRow : deletedRows) {
+        if (deletedRow > nextRow) {
+            writeCSRListNoPersistentDeletions(readCursor, writeCursor, deletedRow - nextRow);
         }
         ++readCursor;
+        nextRow = deletedRow + 1;
+    }
+    if (startRow + oldCSRLength > nextRow) {
+        writeCSRListNoPersistentDeletions(readCursor, writeCursor,
+            startRow + oldCSRLength - nextRow);
     }
 }
 
@@ -1457,6 +1465,7 @@ std::vector<ChunkCheckpointState> CSRNodeGroup::checkpointColumnInRegion(const U
 
     CheckpointReadCursor readCursor{oldChunkScanner, leftCSROffset};
     CheckpointWriteCursor writeCursor{leftCSROffset, *csrState.mm, column->getDataType(), ret};
+    std::vector<row_idx_t> deletedRows;
 
     // Copy per csr list from old chunk and merge with new insertions into the newChunkData.
     for (auto nodeOffset = region.leftNodeOffset; nodeOffset <= region.rightNodeOffset;
@@ -1471,7 +1480,7 @@ std::vector<ChunkCheckpointState> CSRNodeGroup::checkpointColumnInRegion(const U
             writeCSRListNoPersistentDeletions(readCursor, writeCursor, oldCSRLength);
         } else {
             writeCSRListWithPersistentDeletions(txn, readCursor, writeCursor, oldCSRLength,
-                *persistentChunkGroup);
+                *persistentChunkGroup, deletedRows);
         }
         // Merge in-memory insertions into the new chunk.
         if (csrIndex && csrIndex->indices[nodeOffset].isSequential) {
