@@ -19,32 +19,48 @@
 
 # Ladybug, fast-load fork
 
-A fork of [Ladybug](https://github.com/LadybugDB/ladybug) (formerly [Kuzu](https://github.com/kuzudb/kuzu)) optimized for
-**building, extending and editing very large graphs inside one process with bounded memory**: hundreds of millions to
-billions of relationships on a single machine, without running a server. Query behaviour and the Cypher dialect are
-unchanged; everything upstream offers still works.
+[Ladybug](https://github.com/LadybugDB/ladybug) is an embedded graph database: a library that runs inside your process,
+like SQLite, with Cypher queries. It is the successor of [Kuzu](https://github.com/kuzudb/kuzu).
+
+**This fork lets it handle graphs that upstream cannot**: build, grow and edit hundreds of millions to billions of
+relationships on one machine, with a fixed amount of memory. Queries and Cypher are unchanged.
 
 ![Fork vs upstream Ladybug](scripts/benchmark/results.svg)
 
-At 330M relationships with an 8 GB buffer pool, upstream Ladybug cannot build the graph ("buffer pool is full", 13.5 GB
-RSS); this fork builds, extends and edits it. At 33M relationships, both build; the fork uses half the memory to build
-and extends and deletes about 3x faster. Query speed is unchanged: the query engine is upstream's.
+- **330M relationships, 8 GB memory budget:** upstream runs out of memory building the graph; the fork builds it, then
+  extends and edits it.
+- **33M relationships** (both work): the fork builds with half the memory, and adds or deletes data about 3x faster.
+- **Queries:** same speed, same engine.
 
-### How it is faster
+## How
 
-- **Load in buckets, not all at once.** Relationships are split by node-group range and copied one bucket at a time,
-  forward and backward directions separately, so a load holds one bucket in memory instead of the whole table.
-- **Resolve keys once, cheaply.** Node keys are mapped to offsets in one streaming pass that joins on 64-bit key
-  hashes and numbers relationships by their row position, so nothing is materialized or spilled.
-- **Touch only what changes.** A COPY skips the node groups it has no relationship for, merges new relationships into
-  existing ones in contiguous runs, and checkpoints node groups in parallel.
-- **Batch deletes.** A bulk DELETE finds all its rows with one scan per adjacency list, instead of one search per
-  relationship.
-- **Overlap the stages.** The backward buckets are prepared while the engine copies the forward ones.
-- **Ship it whole.** Full-text search and graph algorithms are linked in (no download), and the module can run in the
-  same process as Kuzu.
+- **Load in pieces.** Relationships are copied a slice of the graph at a time, so memory holds one slice, never the
+  whole table.
+- **Look keys up once.** All node keys are turned into internal ids in one fast pass before loading.
+- **Only rewrite what changed.** Adding data touches only the parts of the graph that receive new relationships, and
+  those are rewritten in parallel.
+- **Delete in batches.** A bulk delete scans each adjacency list once, instead of searching once per relationship.
+- **Batteries included.** Full-text search and graph algorithms are built in (no download), and it can run in the same
+  process as Kuzu.
 
-<details><summary>All numbers</summary>
+## Use it
+
+```bash
+git clone --recurse-submodules https://github.com/Seragonia/ladybug
+cd ladybug && make python-bundled
+export PYTHONPATH=$PWD/tools/python_api/build
+```
+
+Load large relationship tables with [`scripts/bucketed_load`](scripts/bucketed_load); everything else is plain Ladybug.
+
+Experimental. Tested by the suites in [`scripts/bucketed_load`](scripts/bucketed_load) (results checked against a
+stock load and against DuckDB), not by upstream's full test suite.
+
+<details><summary>Benchmark details</summary>
+
+Synthetic money-transfer graph with a few very busy accounts (`scripts/benchmark/gen.py`), 16 vCPU / 24 GB RAM,
+8 GB buffer pool, upstream = `pip install ladybug==0.22.0`. Reproduce with `scripts/benchmark/run.sh`; raw results in
+`scripts/benchmark/results.jsonl`. The fork's memory includes the loader's DuckDB, in the same process.
 
 | Data | Measure | Upstream | Fork | Speed-up |
 |---|---|---|---|---|
@@ -79,95 +95,4 @@ and extends and deletes about 3x faster. Query speed is unchanged: the query eng
 
 </details>
 
-Synthetic transaction graph (`scripts/benchmark/gen.py`: 30% of transfers to skewed super-nodes), 8 GB buffer pool,
-16 vCPU / 24 GB RAM, upstream = the `ladybug` 0.22.0 wheel from PyPI. Reproduce with `scripts/benchmark/run.sh`;
-raw results in `scripts/benchmark/results.jsonl`. The fork's peak RAM includes the bucketed loader's DuckDB (capped
-at 3 GB) running in the same process.
-
-Also in this fork: full-text search and graph algorithms work offline (linked in; upstream needs `INSTALL` from the
-network and `LOAD algo` fails on Linux), and `import kuzu` and `import ladybug` work in one process.
-
-## What changed
-
-- **Bucketed relationship COPY.** `DIRECTION='fwd'|'bwd'` builds one direction's CSR; `RAW_OFFSETS=true` takes source,
-  destination and relationship offsets from the input; `REL_OFFSETS=true` keeps the key lookups but takes the
-  relationship offset from the input; `NODE_GROUP_BEGIN/END` keeps only one range of node groups. A COPY leaves the
-  node groups it does not touch alone. A loader copies one node-group-aligned bucket at a time, so memory is bounded by
-  the bucket, not the table: [`scripts/bucketed_load`](scripts/bucketed_load) (with DuckDB, or with the engine only).
-- **Faster extend.** A COPY into populated node groups is merged at checkpoint in contiguous runs, and the node groups
-  of a relationship table are checkpointed in parallel, each rolled back on its own if it fails.
-- **Faster bulk delete.** DELETE and DETACH DELETE find the rows of a whole batch of relationships with one scan per
-  adjacency list, and the checkpoint copies the live runs of a list around its deletions.
-- **Shadow file fix.** The map from data pages to shadow pages is no longer read without its lock: concurrent
-  checkpoint writers could lose updates.
-- **Bundled extensions.** `make python-bundled` links `fts` and `algo` (PAGE_RANK, WCC, SCC, LOUVAIN, K_CORE) into the
-  Python module.
-- **Coexists with Kuzu.** Module-local bindings, `-Bsymbolic`, and a local load of the native module.
-
-## Build
-
-```bash
-git clone --recurse-submodules https://github.com/Seragonia/ladybug
-cd ladybug && make python-bundled
-export PYTHONPATH=$PWD/tools/python_api/build
-```
-
-Experimental: correctness is checked by the tests in [`scripts/bucketed_load`](scripts/bucketed_load) (bucketed loads,
-extends, deletes and updates compared against a stock COPY and against DuckDB, WAL replay, rollback, reopen), run
-repeatedly, not by a full run of upstream's suite.
-
----
-
-## Upstream README
-
-## Ladybug
-Ladybug is an embedded graph database built for query speed and scalability. Ladybug is optimized for handling complex analytical workloads
-on very large databases and provides a set of retrieval features, such as a full text search and vector indices. Our core feature set includes:
-
-- Flexible Property Graph Data Model and Cypher query language
-- Embeddable, serverless integration into applications
-- Native full text search and vector index
-- Columnar disk-based storage
-- Columnar sparse row-based (CSR) adjacency list/join indices
-- Vectorized and factorized query processor
-- Novel and very fast join algorithms
-- Multi-core query parallelism
-- Serializable ACID transactions
-- Wasm (WebAssembly) bindings for fast, secure execution in the browser
-
-Ladybug is being developed by [LadybugDB Developers](https://github.com/LadybugDB) and
-is available under a permissive license. So try it out and help us make it better! We welcome your feedback and feature requests.
-
-The database was formerly known as [Kuzu](https://github.com/kuzudb/kuzu).
-
-## Installation
-
-| Language | Installation                                                           |
-| -------- |------------------------------------------------------------------------|
-| Python   | `pip install ladybug`                                             |
-| NodeJS   | `npm install @ladybugdb/core`                                            |
-| Rust     | `cargo add lbug`                                                       |
-| Go       | `go get github.com/LadybugDB/go-ladybug`                                     |
-| Swift    | [lbug-swift](https://github.com/LadybugDB/swift-ladybug)                     |
-| Java     | [Maven Central](https://central.sonatype.com/artifact/com.ladybugdb/lbug) |
-| C/C++    | [precompiled binaries](https://github.com/LadybugDB/ladybug/releases/latest) |
-| CLI      | [precompiled binaries](https://github.com/LadybugDB/ladybug/releases/latest) |
-
-To learn more about installation, see our [Installation](https://docs.ladybugdb.com/installation) page.
-
-## Getting Started
-
-Refer to our [Getting Started](https://docs.ladybugdb.com/get-started/) page for your first example.
-
-## Build from Source
-
-You can build from source using the instructions provided in the [developer guide](https://docs.ladybugdb.com/developer-guide/).
-
-## Contributing
-We welcome contributions to Ladybug. If you are interested in contributing to Ladybug, please read our [Contributing Guide](CONTRIBUTING.md).
-
-## License
-By contributing to Ladybug, you agree that your contributions will be licensed under the [MIT License](LICENSE).
-
-## Contact
-You can contact us at [social@ladybugdb.com](mailto:social@ladybugdb.com) or [join our Discord community](https://discord.com/invite/hXyHmvW3Vy).
+For everything else, see the [upstream README](https://github.com/LadybugDB/ladybug#readme).
