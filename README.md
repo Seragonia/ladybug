@@ -30,6 +30,20 @@ At 330M relationships with an 8 GB buffer pool, upstream Ladybug cannot build th
 RSS); this fork builds, extends and edits it. At 33M relationships, both build; the fork uses half the memory to build
 and extends and deletes about 3x faster. Query speed is unchanged: the query engine is upstream's.
 
+### How it is faster
+
+- **Load in buckets, not all at once.** Relationships are split by node-group range and copied one bucket at a time,
+  forward and backward directions separately, so a load holds one bucket in memory instead of the whole table.
+- **Resolve keys once, cheaply.** Node keys are mapped to offsets in one streaming pass that joins on 64-bit key
+  hashes and numbers relationships by their row position, so nothing is materialized or spilled.
+- **Touch only what changes.** A COPY skips the node groups it has no relationship for, merges new relationships into
+  existing ones in contiguous runs, and checkpoints node groups in parallel.
+- **Batch deletes.** A bulk DELETE finds all its rows with one scan per adjacency list, instead of one search per
+  relationship.
+- **Overlap the stages.** The backward buckets are prepared while the engine copies the forward ones.
+- **Ship it whole.** Full-text search and graph algorithms are linked in (no download), and the module can run in the
+  same process as Kuzu.
+
 <details><summary>All numbers</summary>
 
 | Data | Measure | Upstream | Fork | Speed-up |
