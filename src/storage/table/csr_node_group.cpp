@@ -1,10 +1,12 @@
 #include "storage/table/csr_node_group.h"
 
 #include <algorithm>
+#include <format>
 #include <limits>
 #include <vector>
 
 #include "common/constants.h"
+#include "common/exception/runtime.h"
 #include "common/serializer/buffer_reader.h"
 #include "common/serializer/buffer_writer.h"
 #include "common/serializer/deserializer.h"
@@ -1046,8 +1048,11 @@ void CSRNodeGroup::checkpoint(MemoryManager&, NodeGroupCheckpointState& state) {
     }
     auto* shadowFile = state.columns.empty() ? nullptr : state.columns[0]->getShadowFile();
     const auto shadowSavepoint =
-        shadowFile == nullptr ? ShadowFile::ShadowSavepoint{0} : shadowFile->createSavepoint();
+        shadowFile == nullptr ? ShadowFile::ShadowSavepoint{} : shadowFile->createSavepoint();
     try {
+        // Attributes the shadow pages this group creates to its savepoint, even while other
+        // groups are checkpointed on other threads.
+        ShadowFile::SavepointScope savepointScope{shadowSavepoint};
         PageReclaimDeferralScope deferralScope{deferredPages.get()};
         if (!persistentChunkGroup) {
             checkpointInMemOnly(lock, state);
@@ -1064,8 +1069,17 @@ void CSRNodeGroup::checkpoint(MemoryManager&, NodeGroupCheckpointState& state) {
         if (persistentSnapshot != nullptr) {
             common::Deserializer deserializer{std::make_unique<common::BufferReader>(
                 persistentSnapshot->getBlobData(), persistentSnapshot->getSize())};
-            auto restoredGroup =
-                ChunkedCSRNodeGroup::deserializeForCheckpointRollback(*state.mm, deserializer);
+            std::unique_ptr<ChunkedCSRNodeGroup> restoredGroup;
+            try {
+                restoredGroup =
+                    ChunkedCSRNodeGroup::deserializeForCheckpointRollback(*state.mm, deserializer);
+            } catch (const std::exception& e) {
+                // Not a buffer manager exception: that one tells NodeGroupCollection that the
+                // group undid its work and can be checkpointed again at once.
+                throw common::RuntimeException(std::format(
+                    "Could not undo a failed checkpoint of node group {}: {}", nodeGroupIdx,
+                    e.what()));
+            }
             // Serialization covers chunk metadata but neither the group version info (whose
             // serialization only supports clean post-checkpoint state) nor the per-chunk
             // pending updates. Checkpoint only reads both (they are reset on success), so

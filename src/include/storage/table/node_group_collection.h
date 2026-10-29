@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 
 #include "storage/stats/table_stats.h"
 #include "storage/table/group_collection.h"
@@ -79,6 +80,13 @@ public:
     uint64_t getEstimatedMemoryUsage() const;
 
     void checkpoint(MemoryManager& memoryManager, NodeGroupCheckpointState& state);
+    // Checkpoints the node groups on up to numThreads threads, each with its own state from
+    // makeState, which must allocate and free pages through the allocator it is given. Only for
+    // node groups whose checkpoint touches no state but its own and, when it throws, undoes its
+    // own work, shadow pages included (see CSRNodeGroup::checkpoint).
+    void checkpointInParallel(MemoryManager& memoryManager, NodeGroupCheckpointState& state,
+        const std::function<std::unique_ptr<NodeGroupCheckpointState>(PageAllocator&)>& makeState,
+        uint64_t numThreads);
     // True when any node group still carries a retention horizon from an earlier pinned
     // checkpoint (see NodeGroup::hasRetainedHorizon).
     bool hasRetainedHorizon() const;

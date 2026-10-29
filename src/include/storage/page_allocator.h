@@ -21,6 +21,10 @@ public:
 
     FileHandle* getDataFH() const { return dataFH; }
 
+    // The allocator a free ends up in. A wrapper that holds frees back names the allocator it
+    // wraps, so a free queued past its lifetime (see PageReclaimDeferral) goes there.
+    virtual PageAllocator& getBackingAllocator() { return *this; }
+
 private:
     FileHandle* dataFH;
 };

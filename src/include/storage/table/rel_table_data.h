@@ -128,7 +128,7 @@ public:
     void checkpoint(const std::vector<common::column_id_t>& columnIDs, PageAllocator& pageAllocator,
         const transaction::Transaction* snapshotTxn = nullptr,
         common::transaction_t retentionHorizon = common::INVALID_TRANSACTION,
-        const std::vector<common::transaction_t>& openStartTSs = {});
+        const std::vector<common::transaction_t>& openStartTSs = {}, uint64_t numThreads = 1);
 
     void pushInsertInfo(const transaction::Transaction* transaction, const CSRNodeGroup& nodeGroup,
         common::row_idx_t numRows_, CSRNodeGroupScanSource source);

@@ -371,7 +371,7 @@ void RelTableData::pushInsertInfo(const Transaction* transaction, const CSRNodeG
 
 void RelTableData::checkpoint(const std::vector<column_id_t>& columnIDs,
     PageAllocator& pageAllocator, const Transaction* snapshotTxn, transaction_t retentionHorizon,
-    const std::vector<transaction_t>& openStartTSs) {
+    const std::vector<transaction_t>& openStartTSs, uint64_t numThreads) {
     std::vector<Column*> checkpointColumnPtrs;
     {
         std::unique_lock lck{columnsMtx};
@@ -391,7 +391,18 @@ void RelTableData::checkpoint(const std::vector<column_id_t>& columnIDs,
     state.transaction = snapshotTxn;
     state.retentionHorizon = retentionHorizon;
     state.openStartTSs = openStartTSs;
-    nodeGroups->checkpoint(*mm, state);
+    // A merge into populated node groups (a COPY that extends a table) rewrites each touched
+    // group: run them on several threads, one group per thread.
+    const auto makeState =
+        [&](PageAllocator& groupAllocator) -> std::unique_ptr<NodeGroupCheckpointState> {
+        auto groupState = std::make_unique<CSRNodeGroupCheckpointState>(state.columnIDs,
+            state.columns, groupAllocator, mm, state.csrOffsetColumn, state.csrLengthColumn);
+        groupState->transaction = state.transaction;
+        groupState->retentionHorizon = state.retentionHorizon;
+        groupState->openStartTSs = state.openStartTSs;
+        return groupState;
+    };
+    nodeGroups->checkpointInParallel(*mm, state, makeState, numThreads);
 }
 
 void RelTableData::serialize(Serializer& serializer) const {

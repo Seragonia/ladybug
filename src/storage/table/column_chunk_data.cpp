@@ -62,7 +62,7 @@ void PageReclaimDeferral::defer(PageRange range, PageAllocator& pageAllocator) {
     if (range.startPageIdx == INVALID_PAGE_IDX) {
         return;
     }
-    frees.push_back(Free{range, &pageAllocator});
+    frees.push_back(Free{range, &pageAllocator.getBackingAllocator()});
 }
 
 void PageReclaimDeferral::defer(const SegmentState& state, PageAllocator& pageAllocator) {

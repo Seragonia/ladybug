@@ -45,17 +45,18 @@ public:
     ShadowFile(BufferManager& bm, common::VirtualFileSystem* vfs, const std::string& databasePath);
 
     // Mutex protocol: hasShadowPage, getShadowPage, clearShadowPage, createShadowPage and
-    // publishShadowPage are for the checkpointing thread only. It is the only writer of
-    // shadowPagesMap, so it may read the map without taking mtx; the functions that modify the
-    // map take mtx exclusively. Read transactions running concurrently with a checkpoint must not
-    // call these and must use readShadowVersionIfExists, which takes mtx shared.
+    // publishShadowPage are for checkpointing threads only. A checkpoint may rewrite several node
+    // groups (and the columns of one) on several threads, each creating shadow pages for pages
+    // no other thread writes, so these take mtx: shared to read the map, exclusively to modify it.
+    // Read transactions running concurrently with a checkpoint must not call these and must use
+    // readShadowVersionIfExists, which takes mtx shared.
     // TODO(Guodong): Remove originalFile param.
-    bool hasShadowPage(common::file_idx_t originalFile, common::page_idx_t originalPage) const {
-        return shadowPagesMap.contains(originalFile) &&
-               shadowPagesMap.at(originalFile).contains(originalPage);
-    }
+    bool hasShadowPage(common::file_idx_t originalFile, common::page_idx_t originalPage) const;
     void clearShadowPage(common::file_idx_t originalFile, common::page_idx_t originalPage);
     common::page_idx_t getShadowPage(common::file_idx_t originalFile,
+        common::page_idx_t originalPage) const;
+    // The shadow page of originalPage, or INVALID_PAGE_IDX if it has none.
+    common::page_idx_t findShadowPage(common::file_idx_t originalFile,
         common::page_idx_t originalPage) const;
     // Adds a new shadow page for originalPage. The page is not visible to
     // readShadowVersionIfExists (nor hasShadowPage) until publishShadowPage is called, so the
@@ -65,19 +66,40 @@ public:
         common::page_idx_t originalPage);
     void publishShadowPage(common::file_idx_t originalFile, common::page_idx_t originalPage,
         common::page_idx_t shadowPageIdx);
-    // A savepoint captures how many shadow pages have been created so far. The checkpointing
-    // thread can roll back to it to drop exactly the shadow pages created since, without
-    // disturbing shadow pages created by already-checkpointed tables. Used to undo a
-    // partially completed node group checkpoint (see LadybugDB/ladybug#1051).
-    using ShadowSavepoint = size_t;
-    ShadowSavepoint createSavepoint() const;
-    // Drops all shadow pages created after the savepoint: their map entries, their
-    // records, and their frames (evicted without flushing, so their contents never reach
-    // the data file). Later allocations reuse the freed shadow page indices, preserving
-    // the invariant that shadowPageRecords[i] describes shadow page i+1 (see flushAll).
-    // Must not be called while a published shadow page of a column data page is pinned
-    // (see mtx).
+    // A savepoint names the shadow pages created under it: those created by a thread while it
+    // holds a SavepointScope of it. Rolling back to it drops exactly those pages, without
+    // disturbing shadow pages created by already-checkpointed tables or by node groups
+    // checkpointed concurrently on other threads. Used to undo a partially completed node group
+    // checkpoint (see LadybugDB/ladybug#1051).
+    struct ShadowSavepoint {
+        uint64_t id = 0; // 0: no savepoint
+    };
+    ShadowSavepoint createSavepoint();
+    // Attributes the shadow pages the current thread creates to a savepoint while in scope.
+    class SavepointScope {
+    public:
+        explicit SavepointScope(ShadowSavepoint savepoint);
+        ~SavepointScope();
+        SavepointScope(const SavepointScope&) = delete;
+        SavepointScope& operator=(const SavepointScope&) = delete;
+        // The savepoint the current thread creates shadow pages under.
+        static ShadowSavepoint current();
+
+    private:
+        uint64_t previous;
+    };
+    // Drops the shadow pages created under the savepoint: their map entries, so readers stop
+    // seeing them at once, and their frames (evicted without flushing, so their contents never
+    // reach the data file). Their records are removed when they are last in the record list;
+    // records with others' records after them are left as holes until compactShadowPages.
+    // Must not be called while the savepoint's own pages are pinned, nor while a published
+    // shadow page of a column data page is pinned by the calling thread (see mtx).
     void rollbackToSavepoint(ShadowSavepoint savepoint);
+    // Closes the holes left by rollbackToSavepoint: moves the shadow pages after a hole into it,
+    // preserving the invariant that shadowPageRecords[i] describes shadow page i+1 (see
+    // flushAll). Only when no other thread creates or writes shadow pages, e.g. once the threads
+    // checkpointing node groups in parallel have joined.
+    void compactShadowPages();
     // Reads the shadow version of a page if the current checkpoint has one, and returns false
     // without calling readOp otherwise. Unlike the functions above, this is safe to call from
     // read transactions running concurrently with a checkpoint: a checkpoint publishes the new
@@ -117,6 +139,7 @@ public:
 
 private:
     FileHandle* getOrCreateShadowingFH();
+    void truncateNoLock(size_t numRecords);
 
     static void replayShadowPageRecordsCore(common::FileInfo& shadowFileInfo,
         common::FileInfo& dataFileInfo, uint64_t maxDatabasePages,
@@ -134,12 +157,18 @@ private:
         std::unordered_map<common::page_idx_t, common::page_idx_t>>
         shadowPagesMap;
     std::vector<ShadowPageRecord> shadowPageRecords;
-    // Protects shadowPagesMap against concurrent readers (see readShadowVersionIfExists). Only
-    // the checkpointing thread modifies the map.
+    // The savepoint each shadow page was created under, parallel to shadowPageRecords; ROLLED_BACK
+    // for the holes rollbackToSavepoint leaves.
+    static constexpr uint64_t ROLLED_BACK = UINT64_MAX;
+    std::vector<uint64_t> shadowPageSavepoints;
+    std::atomic<uint64_t> nextSavepointID{1};
+    // Protects shadowPagesMap, shadowPageRecords and shadowPageSavepoints against concurrent
+    // readers (see readShadowVersionIfExists) and checkpointing threads.
     // Readers hold mtx shared while spinning in optimisticRead on a locked shadow page of a page
-    // they reach through ColumnReadWriter::readFromPage (column data pages). The checkpointing
+    // they reach through ColumnReadWriter::readFromPage (column data pages). A checkpointing
     // thread therefore must not hold such a published shadow page pinned while it takes mtx
     // exclusively (create, publish, clear or reset), or it would deadlock with those readers.
+    // Another checkpointing thread may: it releases the page without taking mtx.
     mutable std::shared_mutex mtx;
     // Fast path for readers: false when there is no shadow page.
     std::atomic<bool> hasShadowPages{false};

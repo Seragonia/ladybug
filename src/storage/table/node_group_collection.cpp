@@ -1,7 +1,13 @@
 #include "storage/table/node_group_collection.h"
 
+#include <mutex>
+#include <thread>
+
+#include "common/exception/buffer_manager.h"
 #include "common/vector/value_vector.h"
+#include "storage/shadow_file.h"
 #include "storage/table/chunked_node_group.h"
+#include "storage/table/column.h"
 #include "storage/table/csr_node_group.h"
 #include "storage/table/table.h"
 #include "transaction/transaction.h"
@@ -211,10 +217,135 @@ bool NodeGroupCollection::hasRetainedHorizon() const {
 
 void NodeGroupCollection::checkpoint(MemoryManager& memoryManager,
     NodeGroupCheckpointState& state) {
+    checkpointInParallel(memoryManager, state, nullptr /*makeState*/, 1 /*numThreads*/);
+}
+
+namespace {
+// The page allocator of one node group checkpoint run beside others. It holds the frees back
+// until the group succeeds: a failed group then frees no page its restored chunks still use,
+// and gives back the pages it allocated, so it can be checkpointed again in the same checkpoint.
+class GroupCheckpointAllocator final : public PageAllocator {
+public:
+    explicit GroupCheckpointAllocator(PageAllocator& allocator)
+        : PageAllocator{allocator.getDataFH()}, allocator{allocator} {}
+
+    PageRange allocatePageRange(page_idx_t numPages) override {
+        const auto range = allocator.allocatePageRange(numPages);
+        if (numPages > 0) {
+            std::unique_lock lck{mtx};
+            allocated.push_back(range);
+        }
+        return range;
+    }
+    void freePageRange(PageRange range) override {
+        std::unique_lock lck{mtx};
+        frees.push_back(range);
+    }
+    PageAllocator& getBackingAllocator() override { return allocator; }
+
+    void commit() {
+        std::unique_lock lck{mtx};
+        for (const auto& range : frees) {
+            allocator.freePageRange(range);
+        }
+        frees.clear();
+        allocated.clear();
+    }
+    // The failed group's chunks reference none of the pages it allocated. They are freed like
+    // any page freed by a checkpoint: reusable once the checkpoint is durable.
+    void rollback() {
+        std::unique_lock lck{mtx};
+        for (const auto& range : allocated) {
+            allocator.freePageRange(range);
+        }
+        frees.clear();
+        allocated.clear();
+    }
+
+private:
+    PageAllocator& allocator;
+    std::mutex mtx;
+    std::vector<PageRange> allocated;
+    std::vector<PageRange> frees;
+};
+
+bool isOutOfMemory(const std::exception_ptr& error) {
+    try {
+        std::rethrow_exception(error);
+    } catch (const BufferManagerException&) {
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+} // namespace
+
+void NodeGroupCollection::checkpointInParallel(MemoryManager& memoryManager,
+    NodeGroupCheckpointState& state,
+    const std::function<std::unique_ptr<NodeGroupCheckpointState>(PageAllocator&)>& makeState,
+    uint64_t numThreads) {
     DASSERT(residency == ResidencyState::ON_DISK);
     const auto lock = nodeGroups.lock();
-    for (const auto& nodeGroup : nodeGroups.getAllGroups(lock)) {
-        nodeGroup->checkpoint(memoryManager, state);
+    const auto& groups = nodeGroups.getAllGroups(lock);
+    numThreads = std::min<uint64_t>(numThreads, groups.size());
+    if (numThreads < 2) {
+        for (const auto& nodeGroup : groups) {
+            nodeGroup->checkpoint(memoryManager, state);
+        }
+    } else {
+        // Each group is checkpointed whole on one thread, so its page-free deferral (thread
+        // local) and its shadow-file savepoint (attributed per thread) cover just its own work.
+        std::atomic<size_t> nextGroup{0};
+        std::atomic<bool> failed{false};
+        std::vector<std::exception_ptr> errors(numThreads);
+        std::vector<uint8_t> done(groups.size(), 0);
+        std::vector<std::thread> workers;
+        workers.reserve(numThreads);
+        for (auto t = 0u; t < numThreads; t++) {
+            workers.emplace_back([&, t] {
+                GroupCheckpointAllocator allocator{state.pageAllocator};
+                try {
+                    const auto groupState = makeState(allocator);
+                    while (!failed.load(std::memory_order_relaxed)) {
+                        const auto i = nextGroup.fetch_add(1);
+                        if (i >= groups.size()) {
+                            break;
+                        }
+                        groups[i]->checkpoint(memoryManager, *groupState);
+                        allocator.commit();
+                        done[i] = 1;
+                    }
+                } catch (...) {
+                    allocator.rollback();
+                    errors[t] = std::current_exception();
+                    failed.store(true, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        if (failed.load()) {
+            // A failed group dropped its shadow pages, leaving holes between those of the groups
+            // that ran beside it: close them while no thread writes shadow pages. The groups that
+            // succeeded keep their work, as when groups run one after another.
+            if (!state.columns.empty() && state.columns[0]->getShadowFile() != nullptr) {
+                state.columns[0]->getShadowFile()->compactShadowPages();
+            }
+            for (auto& error : errors) {
+                if (error && !isOutOfMemory(error)) {
+                    std::rethrow_exception(error);
+                }
+            }
+            // Groups running beside each other ran out of memory. A failed group undid all its
+            // work (CSRNodeGroup::checkpoint rethrows a buffer manager exception only then), so
+            // checkpoint it, and the groups not started, one at a time as without threads.
+            for (auto i = 0u; i < groups.size(); i++) {
+                if (!done[i]) {
+                    groups[i]->checkpoint(memoryManager, state);
+                }
+            }
+        }
     }
     std::vector<LogicalType> typesAfterCheckpoint;
     for (auto i = 0u; i < state.columnIDs.size(); i++) {

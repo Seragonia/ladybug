@@ -13,11 +13,10 @@ ShadowPageAndFrame ShadowUtils::createShadowVersionIfNecessaryAndPinPage(page_id
     bool skipReadingOriginalPage, FileHandle& fileHandle, ShadowFile& shadowFile) {
     DASSERT(!fileHandle.isInMemoryMode());
     const auto fileIdx = fileHandle.getFileIndex();
-    page_idx_t shadowPage = INVALID_PAGE_IDX;
+    page_idx_t shadowPage = shadowFile.findShadowPage(fileIdx, originalPage);
     uint8_t* shadowFrame = nullptr;
     try {
-        if (shadowFile.hasShadowPage(fileIdx, originalPage)) {
-            shadowPage = shadowFile.getShadowPage(fileIdx, originalPage);
+        if (shadowPage != INVALID_PAGE_IDX) {
             shadowFrame =
                 shadowFile.getShadowingFH().pinPage(shadowPage, PageReadPolicy::READ_PAGE);
         } else {
@@ -47,10 +46,11 @@ ShadowPageAndFrame ShadowUtils::createShadowVersionIfNecessaryAndPinPage(page_id
 std::pair<FileHandle*, page_idx_t> ShadowUtils::getFileHandleAndPhysicalPageIdxToPin(
     FileHandle& fileHandle, page_idx_t pageIdx, const ShadowFile& shadowFile,
     transaction::TransactionType trxType) {
-    if (trxType == transaction::TransactionType::CHECKPOINT &&
-        shadowFile.hasShadowPage(fileHandle.getFileIndex(), pageIdx)) {
-        return std::make_pair(&shadowFile.getShadowingFH(),
-            shadowFile.getShadowPage(fileHandle.getFileIndex(), pageIdx));
+    if (trxType == transaction::TransactionType::CHECKPOINT) {
+        const auto shadowPage = shadowFile.findShadowPage(fileHandle.getFileIndex(), pageIdx);
+        if (shadowPage != INVALID_PAGE_IDX) {
+            return std::make_pair(&shadowFile.getShadowingFH(), shadowPage);
+        }
     }
     return std::make_pair(&fileHandle, pageIdx);
 }
