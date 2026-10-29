@@ -1,11 +1,14 @@
 """Correctness of the fork's bucketed rel COPY against a stock COPY of the same edges.
-usage: test_fork.py <work_dir>"""
+usage: test_bucketed_load.py <work_dir> [duckdb|engine]
+engine: the engine-only loader (COPY options REL_OFFSETS, NODE_GROUP_BEGIN/END); DuckDB then only
+builds the test data and the expectations."""
 import sys, os, shutil, random, duckdb
 import ladybug as lb
 sys.path.insert(0, os.path.dirname(__file__))
-from bucketed_load import bucketed_copy
+from bucketed_load import bucketed_copy, engine_bucketed_copy
 
 w = sys.argv[1]
+mode = sys.argv[2] if len(sys.argv) > 2 else "duckdb"
 shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
 N, E = 400_000, 2_000_000  # 4 node groups; nodes past 80% get no edge at all
 d = duckdb.connect()
@@ -17,6 +20,8 @@ d.execute(f"""COPY (SELECT 'A' || lpad((hash(i) % {int(N * .8)})::VARCHAR, 9, '0
               UNION ALL  -- a hub with a list long enough for the row lookup cache
               SELECT 'A' || lpad((i % {int(N * .8)})::VARCHAR, 9, '0'), 'A000000005', (i % 1000)::DOUBLE, 'hub'
               FROM range(20000) r(i)) TO '{w}/edges.parquet'""")
+# The same edges with a 0-based row sequence, as a caller staging its rows would write it.
+d.execute(f"COPY (SELECT *, row_number() OVER () - 1 AS rn FROM '{w}/edges.parquet') TO '{w}/edges_rn.parquet'")
 
 def fresh(name):
     db = lb.Database(f"{w}/{name}.lbug"); c = lb.Connection(db)
@@ -27,8 +32,12 @@ def fresh(name):
 
 db1, c1 = fresh("stock"); c1.execute(f"COPY T FROM '{w}/edges.parquet'")
 db2, c2 = fresh("fork")
-print(bucketed_copy(c2, "T", "A", "id", "A", "id", f"'{w}/edges.parquet'", "s", "t", ["amount", "kind"],
-                    f"{w}/work", edges_per_bucket=300_000, log=lambda *a: None))
+if mode == "engine":  # the input gets a row number column first
+    print(engine_bucketed_copy(c2, "T", "A", "A", f"{w}/edges.parquet", "s", "t", ["amount", "kind"],
+                               f"{w}/work", edges_per_bucket=300_000, log=lambda *a: None))
+else:
+    print(bucketed_copy(c2, "T", "A", "id", "A", "id", f"'{w}/edges.parquet'", "s", "t", ["amount", "kind"],
+                        f"{w}/work", edges_per_bucket=300_000, log=lambda *a: None))
 
 def rows(c, q, **p):
     r = c.execute(q, p); out = []
@@ -54,6 +63,15 @@ def compare(tag):
     fw = rows(c2, "MATCH (a:A)-[r:T]->(b:A) WHERE a.grp = 3 RETURN a.id, b.id, offset(id(r))")
     bw = rows(c2, "MATCH (b:A)<-[r:T]-(a:A) WHERE a.grp = 3 RETURN a.id, b.id, offset(id(r))")
     assert fw == bw and len(fw) > 0, (tag, len(fw), len(bw))
+    # Whole table, both DBs: rel ids are unique and each rel reads the same through FWD and BWD.
+    for name, c in (("stock", c1), ("fork", c2)):
+        for dirn, pat in (("f", "(a:A)-[r:T]->(b:A)"), ("b", "(b:A)<-[r:T]-(a:A)")):
+            c.execute(f"COPY (MATCH {pat} RETURN a.id AS a, b.id AS b, r.amount AS amount, r.kind AS kind, "
+                      f"offset(id(r)) AS rid) TO '{w}/dump_{dirn}.parquet'")
+        n, n_ids = d.execute(f"SELECT count(*), count(DISTINCT rid) FROM '{w}/dump_f.parquet'").fetchone()
+        diff = d.execute(f"""SELECT count(*) FROM (SELECT * FROM '{w}/dump_f.parquet' EXCEPT ALL
+                             SELECT * FROM '{w}/dump_b.parquet')""").fetchone()[0]
+        assert n == n_ids and diff == 0, (tag, name, n, n_ids, diff)
     print(tag, "ok", len(fw))
 
 compare("load")
@@ -85,7 +103,37 @@ compare("reopen")
 # A second bucketed load on top of existing data (EXTEND) must append, not collide.
 extra = f"(SELECT * FROM '{w}/edges.parquet' LIMIT 100000)"
 c1.execute(f"COPY T FROM (LOAD FROM '{w}/edges.parquet' WHERE amount >= 990 RETURN *)")
-bucketed_copy(c2, "T", "A", "id", "A", "id", f"(SELECT * FROM '{w}/edges.parquet' WHERE amount >= 990)", "s", "t",
-              ["amount", "kind"], f"{w}/work", edges_per_bucket=300_000, log=lambda *a: None)
+if mode == "engine":  # rel offsets from the input's row sequence, with holes where the filter drops rows
+    engine_bucketed_copy(c2, "T", "A", "A", f"{w}/edges_rn.parquet", "s", "t", ["amount", "kind"], f"{w}/work",
+                         rel_col="rn", where="amount >= 990", edges_per_bucket=300_000, log=lambda *a: None)
+else:
+    bucketed_copy(c2, "T", "A", "id", "A", "id", f"(SELECT * FROM '{w}/edges.parquet' WHERE amount >= 990)", "s", "t",
+                  ["amount", "kind"], f"{w}/work", edges_per_bucket=300_000, log=lambda *a: None)
 compare("bucketed extend")
+if mode == "engine":
+    # One bucket alone keeps exactly the rels whose src is in its node groups. The table stores FWD
+    # only, so every query reads it (a BWD-only table cannot be queried; BWD buckets are covered by
+    # the FWD/BWD dump comparison above).
+    src = f"(LOAD FROM '{w}/edges_rn.parquet' RETURN s, t, rn, amount, kind)"
+    for dirn, col in (("fwd", "s"),):
+        shutil.rmtree(f"{w}/one_{dirn}.lbug", ignore_errors=True)
+        db3 = lb.Database(f"{w}/one_{dirn}.lbug"); c3 = lb.Connection(db3)
+        c3.execute("CREATE NODE TABLE A(id STRING, grp INT64, PRIMARY KEY(id))")
+        c3.execute(f"CREATE REL TABLE T(FROM A TO A, amount DOUBLE, kind STRING) WITH (STORAGE_DIRECTION='{dirn}')")
+        c3.execute(f"COPY A FROM '{w}/nodes.parquet'")
+        c3.execute(f"COPY T FROM {src} (DIRECTION='{dirn}', REL_OFFSETS=true, NODE_GROUP_BEGIN=1, NODE_GROUP_END=2)")
+        c3.execute(f"COPY (MATCH (n:A) RETURN n.id AS id, offset(id(n)) AS off) TO '{w}/one_map.parquet'")
+        expected = d.execute(f"""SELECT count(*), sum(amount), min(rn), max(rn) FROM '{w}/edges_rn.parquet' e
+            JOIN '{w}/one_map.parquet' m ON m.id = e.{col} WHERE m.off >= 131072 AND m.off < 262144""").fetchone()
+        got = rows(c3, "MATCH (a:A)-[r:T]->(b:A) RETURN count(*), sum(r.amount), min(offset(id(r))), max(offset(id(r)))")[0]
+        assert got == expected and got[0] > 0, (dirn, got, expected)
+    for bad in ("REL_OFFSETS=true, NODE_GROUP_BEGIN=1", "DIRECTION='fwd', NODE_GROUP_BEGIN=1",
+                "DIRECTION='fwd', REL_OFFSETS=true, NODE_GROUP_BEGIN='1'",
+                "DIRECTION='fwd', REL_OFFSETS=true, RAW_OFFSETS=true"):
+        try:
+            c3.execute(f"COPY T FROM {src} ({bad})")
+            raise AssertionError(bad)
+        except RuntimeError as e:
+            assert "COPY option" in str(e), (bad, e)
+    print("one bucket ok", got[0])
 print("ALL OK")
