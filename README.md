@@ -75,13 +75,17 @@ network and `LOAD algo` fails on Linux), and `import kuzu` and `import ladybug` 
 
 ## What changed
 
-- **Bucketed relationship COPY.** Two COPY options, `DIRECTION='fwd'|'bwd'` (build one direction's CSR) and
-  `RAW_OFFSETS=true` (take source, destination and relationship offsets from the input instead of looking up keys),
-  plus a COPY that leaves untouched node groups alone. A loader can then copy one node-group-aligned bucket at a time,
-  so memory is bounded by the bucket, not the table. See [`scripts/bucketed_load`](scripts/bucketed_load).
-- **Faster extend.** A COPY into populated node groups is merged at checkpoint in contiguous runs instead of row by row.
-- **Faster bulk delete and update.** Long relationship lists are scanned once per transaction instead of once per
-  deleted or updated relationship.
+- **Bucketed relationship COPY.** `DIRECTION='fwd'|'bwd'` builds one direction's CSR; `RAW_OFFSETS=true` takes source,
+  destination and relationship offsets from the input; `REL_OFFSETS=true` keeps the key lookups but takes the
+  relationship offset from the input; `NODE_GROUP_BEGIN/END` keeps only one range of node groups. A COPY leaves the
+  node groups it does not touch alone. A loader copies one node-group-aligned bucket at a time, so memory is bounded by
+  the bucket, not the table: [`scripts/bucketed_load`](scripts/bucketed_load) (with DuckDB, or with the engine only).
+- **Faster extend.** A COPY into populated node groups is merged at checkpoint in contiguous runs, and the node groups
+  of a relationship table are checkpointed in parallel, each rolled back on its own if it fails.
+- **Faster bulk delete.** DELETE and DETACH DELETE find the rows of a whole batch of relationships with one scan per
+  adjacency list, and the checkpoint copies the live runs of a list around its deletions.
+- **Shadow file fix.** The map from data pages to shadow pages is no longer read without its lock: concurrent
+  checkpoint writers could lose updates.
 - **Bundled extensions.** `make python-bundled` links `fts` and `algo` (PAGE_RANK, WCC, SCC, LOUVAIN, K_CORE) into the
   Python module.
 - **Coexists with Kuzu.** Module-local bindings, `-Bsymbolic`, and a local load of the native module.
@@ -94,8 +98,9 @@ cd ladybug && make python-bundled
 export PYTHONPATH=$PWD/tools/python_api/build
 ```
 
-Experimental: correctness is checked by the tests in [`scripts/bucketed_load`](scripts/bucketed_load) (bucketed load,
-extend, deletes and updates compared against a stock COPY and against DuckDB), not by a full run of upstream's suite.
+Experimental: correctness is checked by the tests in [`scripts/bucketed_load`](scripts/bucketed_load) (bucketed loads,
+extends, deletes and updates compared against a stock COPY and against DuckDB, WAL replay, rollback, reopen), run
+repeatedly, not by a full run of upstream's suite.
 
 ---
 
