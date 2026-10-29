@@ -1192,6 +1192,7 @@ std::vector<std::unique_ptr<ColumnChunkData>> ColumnChunkData::split(bool target
             maxValuesPerSegment = maxPages * valuesPerPage;
         }
     }
+    const auto chunkCountBound = maxValuesPerSegment;
 
     std::vector<std::unique_ptr<ColumnChunkData>> newSegments;
     uint64_t pos = 0;
@@ -1299,6 +1300,13 @@ std::vector<std::unique_ptr<ColumnChunkData>> ColumnChunkData::split(bool target
             shrinkSegmentToFit(*newSegment, pos);
             // If the segment still exceeds targetSize after the bounded shrink above,
             // keep it as-is (it's the minimum viable segment).
+            // The rest of the chunk most likely encodes like this segment (a segment-local float
+            // encoding often takes a bit more than the whole chunk's): fill the next segments to
+            // the count that fitted, so each needs one size evaluation instead of a shrink of up
+            // to five. Not below 3/4 of the chunk's bound, so that one odd segment cannot make
+            // all the others small.
+            maxValuesPerSegment = std::max(chunkCountBound * 3 / 4,
+                std::min(maxValuesPerSegment, newSegment->getNumValues()));
         } else if (maxValuesPerSegment == UINT64_MAX && pos < numValues &&
                    newSegment->getNumValues() > chunkSize &&
                    newSegment->getSizeOnDiskInMemoryStats() > targetSize) {
