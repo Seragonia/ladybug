@@ -4,7 +4,7 @@ DuckDB resolves keys to node offsets and assigns rel offsets once, then splits t
 node-group-aligned buckets: by src for the FWD CSR, by dst for the BWD CSR. Each bucket is one COPY
 that writes only the node groups it covers, so RAM is bounded by the bucket, not the table, and an
 extend writes only the node groups it touches. engine_bucketed_copy does the same without DuckDB."""
-import os, shutil, threading, time
+import contextlib, os, shutil, threading, time
 
 NODE_GROUP_SIZE = 1 << 17
 
@@ -20,6 +20,28 @@ def next_rel_offset(conn, rel):
 
 def scalar(conn, query):
     return conn.execute(query).get_next()[0]
+
+
+@contextlib.contextmanager
+def one_checkpoint(conn, rel, base):
+    """Checkpoints once after the bucket COPYs of a load into an empty rel table, not after each.
+
+    A COPY checkpoints when it commits, and each checkpoint syncs the data file: ~0.3-1 s a bucket,
+    and much more while another process writes (the BWD split), since ext4 then syncs its writes
+    too. Into an empty table every COPY writes its node groups straight to disk, so skipping the
+    checkpoints between them keeps nothing more in memory. An extend keeps them: the rels it adds
+    to existing node groups stay in memory until the next checkpoint."""
+    fresh = base == 0 and scalar(conn, f"CALL storage_info('{rel}') RETURN count(*)") == 0
+    defer = fresh and str(scalar(conn, "CALL current_setting('auto_checkpoint') RETURN *")) == "True"
+    if defer:
+        conn.execute("CALL auto_checkpoint=false")
+    try:
+        yield
+    finally:
+        if defer:
+            conn.execute("CALL auto_checkpoint=true")
+    if defer:
+        conn.execute("CHECKPOINT")
 
 
 def add_row_numbers(path, out_path, column="_rn"):
@@ -68,18 +90,19 @@ def engine_bucketed_copy(conn, rel, src_table, dst_table, edges, src_col, dst_co
     k = max(1, -(-n_edges // edges_per_bucket))
     log("count", round(time.time() - t, 1), "k", k)
     timings = {}
-    for name, table in (("fwd", src_table), ("bwd", dst_table)):
-        n_nodes = (scalar(conn, f"MATCH (n:{table}) RETURN max(offset(id(n)))") or 0) + 1
-        n_groups = -(-n_nodes // NODE_GROUP_SIZE)
-        span = max(1, -(-n_groups // k))
-        for begin in range(0, n_groups, span):
-            # The last bucket is open-ended so that no rel is ever left out.
-            end = f", NODE_GROUP_END={begin + span}" if begin + span < n_groups else ""
-            t = time.time()
-            conn.execute(f"COPY {rel} FROM {source} (DIRECTION='{name}', REL_OFFSETS=true, "
-                         f"NODE_GROUP_BEGIN={begin}{end})")
-            timings[f"{name}_{begin}"] = round(time.time() - t, 2)
-            log(name, begin, timings[f"{name}_{begin}"])
+    with one_checkpoint(conn, rel, base):
+        for name, table in (("fwd", src_table), ("bwd", dst_table)):
+            n_nodes = (scalar(conn, f"MATCH (n:{table}) RETURN max(offset(id(n)))") or 0) + 1
+            n_groups = -(-n_nodes // NODE_GROUP_SIZE)
+            span = max(1, -(-n_groups // k))
+            for begin in range(0, n_groups, span):
+                # The last bucket is open-ended so that no rel is ever left out.
+                end = f", NODE_GROUP_END={begin + span}" if begin + span < n_groups else ""
+                t = time.time()
+                conn.execute(f"COPY {rel} FROM {source} (DIRECTION='{name}', REL_OFFSETS=true, "
+                             f"NODE_GROUP_BEGIN={begin}{end})")
+                timings[f"{name}_{begin}"] = round(time.time() - t, 2)
+                log(name, begin, timings[f"{name}_{begin}"])
     shutil.rmtree(work_dir, ignore_errors=True)
     return {"edges": n_edges, "buckets": k, "copies": timings, "total_s": round(time.time() - t0, 1)}
 
@@ -143,7 +166,7 @@ def bucketed_copy(conn, rel, src_table, src_key, dst_table, dst_key, edges, src_
         source, rel_offset = f"{edges} e", f"{base} + row_number() OVER () - 1"
     # Resolve keys once, straight into the FWD buckets; edges whose endpoints are missing are dropped, as
     # COPY's key lookups would. The BWD buckets are then split from the FWD ones.
-    d.execute(f"""COPY (SELECT s.off AS src, t.off AS dst, {rel_offset} AS rel{cols}, s.off // {src_span} AS b
+    d.execute(f"""COPY (SELECT s.off AS src, t.off AS dst, ({rel_offset})::BIGINT AS rel{cols}, s.off // {src_span} AS b
         FROM {source} JOIN '{maps["src_map"]}' s ON s.k = {key("src_map", src_col)}
         JOIN '{maps["dst_map"]}' t ON t.k = {key("dst_map", dst_col)}{flt})
         TO '{work_dir}/fwd' (FORMAT parquet, PARTITION_BY (b))""")
@@ -164,7 +187,6 @@ def bucketed_copy(conn, rel, src_table, src_key, dst_table, dst_key, edges, src_
             d.close()
 
     splitter = threading.Thread(target=split_bwd)
-    splitter.start()
     timings = {}
 
     def copy_buckets(name):
@@ -175,12 +197,14 @@ def bucketed_copy(conn, rel, src_table, src_key, dst_table, dst_key, edges, src_
             timings[f"{name}_{b}"] = round(time.time() - t, 2)
             log(name, b, timings[f"{name}_{b}"])
 
-    try:
-        copy_buckets("fwd")
-    finally:
-        splitter.join()
-    if split_error:
-        raise split_error[0]
-    copy_buckets("bwd")
+    with one_checkpoint(conn, rel, base):
+        splitter.start()
+        try:
+            copy_buckets("fwd")
+        finally:
+            splitter.join()
+        if split_error:
+            raise split_error[0]
+        copy_buckets("bwd")
     shutil.rmtree(work_dir, ignore_errors=True)
     return {"edges": n_edges, "buckets": k, "copies": timings, "total_s": round(time.time() - t0, 1)}
