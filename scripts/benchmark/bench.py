@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 EDGES_PER_BUCKET = 25_000_000
 # The bucketed loader runs DuckDB in this process: its memory counts in the fork's peak RSS.
-DUCKDB_MEMORY = "3GB"
+DUCKDB_MEMORY = os.environ.get("BENCH_DUCKDB_MEMORY", "3GB")
 out = {"engine": engine, "phase": phase, "data": os.path.basename(data.rstrip("/"))}
 
 
