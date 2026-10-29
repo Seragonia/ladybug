@@ -1474,10 +1474,26 @@ std::vector<ChunkCheckpointState> CSRNodeGroup::checkpointColumnInRegion(const U
                 *persistentChunkGroup);
         }
         // Merge in-memory insertions into the new chunk.
-        if (csrIndex) {
+        if (csrIndex && csrIndex->indices[nodeOffset].isSequential) {
+            // A COPY appends the rels of a node contiguously, and a sequential list holds no
+            // deleted row: copy it a chunked group at a time instead of one row at a time.
+            const auto& nodeIndex = csrIndex->indices[nodeOffset];
+            auto row = nodeIndex.rowIndices[0];
+            const auto endRow = row + nodeIndex.rowIndices[1];
+            while (row < endRow) {
+                auto [chunkIdx, rowInChunk] = StorageUtils::getQuotientRemainder(row,
+                    StorageConfig::CHUNKED_NODE_GROUP_CAPACITY);
+                const auto numRows = std::min<row_idx_t>(endRow - row,
+                    StorageConfig::CHUNKED_NODE_GROUP_CAPACITY - rowInChunk);
+                chunkedGroups.getGroup(lock, chunkIdx)
+                    ->getColumnChunk(columnID)
+                    .scanCommitted<ResidencyState::IN_MEMORY>(txn, chunkState,
+                        writeCursor.getCurrentSegmentForWrite(numRows), rowInChunk, numRows);
+                writeCursor.advance(numRows);
+                row += numRows;
+            }
+        } else if (csrIndex) {
             auto rows = csrIndex->indices[nodeOffset].getRows();
-            // TODO(Guodong): Optimize here. if no deletions and has sequential rows, scan in
-            // range.
             for (const auto row : rows) {
                 if (row == INVALID_ROW_IDX) {
                     continue;
@@ -1530,6 +1546,26 @@ void CSRNodeGroup::collectRegionChangesAndUpdateHeaderLength(const UniqLock& loc
     collectOnDiskRegionChangesAndUpdateHeaderLength(lock, region, csrState);
 }
 
+bool CSRNodeGroup::isSequentialWithoutDeletions(const UniqLock& lock, const Transaction* transaction,
+    const NodeCSRIndex& nodeIndex) const {
+    if (!nodeIndex.isSequential || nodeIndex.rowIndices.empty()) {
+        return false;
+    }
+    const auto startRow = nodeIndex.rowIndices[0];
+    const auto endRow = startRow + nodeIndex.rowIndices[1];
+    const auto firstChunk = startRow / StorageConfig::CHUNKED_NODE_GROUP_CAPACITY;
+    const auto lastChunk = (endRow - 1) / StorageConfig::CHUNKED_NODE_GROUP_CAPACITY;
+    if (lastChunk >= chunkedGroups.getNumGroups(lock)) {
+        return false;
+    }
+    for (auto chunkIdx = firstChunk; chunkIdx <= lastChunk; chunkIdx++) {
+        if (chunkedGroups.getGroup(lock, chunkIdx)->hasDeletions(transaction)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void CSRNodeGroup::collectInMemRegionChangesAndUpdateHeaderLength(const UniqLock& lock,
     CSRRegion& region, const CSRNodeGroupCheckpointState& csrState) const {
     const auto* txn = csrState.transaction ? csrState.transaction : &DUMMY_CHECKPOINT_TRANSACTION;
@@ -1537,6 +1573,15 @@ void CSRNodeGroup::collectInMemRegionChangesAndUpdateHeaderLength(const UniqLock
     if (csrIndex) {
         for (auto nodeOffset = region.leftNodeOffset; nodeOffset <= region.rightNodeOffset;
              nodeOffset++) {
+            const auto oldLength = csrState.oldHeader->getCSRLength(nodeOffset);
+            if (isSequentialWithoutDeletions(lock, txn, csrIndex->indices[nodeOffset])) {
+                // The common case after a COPY: no need to check the rows one by one.
+                const auto numInsertedRows = csrIndex->indices[nodeOffset].getNumRows();
+                csrState.newHeader->length->setValue<length_t>(oldLength + numInsertedRows,
+                    nodeOffset);
+                numInsertionsInRegion += numInsertedRows;
+                continue;
+            }
             auto rows = csrIndex->indices[nodeOffset].getRows();
             row_idx_t numInsertedRows = rows.size();
             row_idx_t numInMemDeletionsInCSR = 0;
@@ -1562,7 +1607,6 @@ void CSRNodeGroup::collectInMemRegionChangesAndUpdateHeaderLength(const UniqLock
             }
             DASSERT(numInMemDeletionsInCSR <= numInsertedRows);
             numInsertedRows -= numInMemDeletionsInCSR;
-            const auto oldLength = csrState.oldHeader->getCSRLength(nodeOffset);
             const auto newLength = oldLength + numInsertedRows;
             csrState.newHeader->length->setValue<length_t>(newLength, nodeOffset);
             numInsertionsInRegion += numInsertedRows;

@@ -333,6 +333,8 @@ private:
         const CSRNodeGroupCheckpointState& csrState) const;
     void collectInMemRegionChangesAndUpdateHeaderLength(const common::UniqLock& lock,
         CSRRegion& region, const CSRNodeGroupCheckpointState& csrState) const;
+    bool isSequentialWithoutDeletions(const common::UniqLock& lock,
+        const transaction::Transaction* transaction, const NodeCSRIndex& nodeIndex) const;
     void collectOnDiskRegionChangesAndUpdateHeaderLength(const common::UniqLock& lock,
         CSRRegion& region, const CSRNodeGroupCheckpointState& csrState) const;
 
