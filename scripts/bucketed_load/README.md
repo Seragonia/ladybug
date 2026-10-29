@@ -47,4 +47,5 @@ engine_bucketed_copy(conn, "TX", "Account", "Account", "tx.parquet", "src", "dst
 Tests (build with `make python-bundled`, then put `tools/python_api/build` on `PYTHONPATH`):
 
 - `python test_bucketed_load.py <work_dir> [duckdb|engine]` compares a bucketed load, extend, deletes and updates with a stock COPY.
+- `python test_bulk_delete.py <work_dir>` checks bulk DELETE, DETACH DELETE and SET against DuckDB in both directions, with WAL replay, rollback, checkpoint and reopen.
 - `python test_bundled_extensions.py` checks FTS, PAGE_RANK and WCC without INSTALL, with kuzu imported in the same process.
