@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cmath>
+#include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 
 #include "common/enums/rel_direction.h"
 #include "common/enums/rel_multiplicity.h"
@@ -159,6 +161,10 @@ private:
 
     const VersionRecordHandler* getVersionRecordHandler(CSRNodeGroupScanSource source) const;
 
+    using RowLocation = std::pair<CSRNodeGroupScanSource, common::row_idx_t>;
+    // Lists at least this long get their rows cached by findMatchingRow (see there).
+    static constexpr common::row_idx_t ROW_LOOKUP_CACHE_MIN_LIST_SIZE = 4096;
+
 private:
     Table& table;
     MemoryManager* mm;
@@ -179,6 +185,14 @@ private:
 
     PersistentVersionRecordHandler persistentVersionRecordHandler;
     InMemoryVersionRecordHandler inMemoryVersionRecordHandler;
+
+    // Rows of the long CSR lists findMatchingRow scanned in the current write transaction, by bound
+    // node then rel offset. Row indices only change at checkpoint, after the transaction ended.
+    mutable std::mutex rowLookupMtx;
+    mutable common::transaction_t rowLookupTransactionID = common::INVALID_TRANSACTION;
+    mutable std::unordered_map<common::offset_t,
+        std::unordered_map<common::offset_t, RowLocation>>
+        rowLookupCache;
 };
 
 } // namespace storage

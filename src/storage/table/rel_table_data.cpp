@@ -186,6 +186,24 @@ std::pair<CSRNodeGroupScanSource, row_idx_t> RelTableData::findMatchingRow(Trans
         return {CSRNodeGroupScanSource::NONE, INVALID_ROW_IDX};
     }
 
+    // Deleting or updating many rels of one node scans its list once per rel, which is quadratic
+    // for a node with millions of rels. Long lists are scanned once per transaction and cached.
+    {
+        std::unique_lock lck{rowLookupMtx};
+        if (rowLookupTransactionID != transaction->getID()) {
+            rowLookupCache.clear();
+            rowLookupTransactionID = transaction->getID();
+        }
+        const auto cachedList = rowLookupCache.find(boundNodeOffset);
+        if (cachedList != rowLookupCache.end()) {
+            const auto cachedRow = cachedList->second.find(relOffset);
+            if (cachedRow != cachedList->second.end()) {
+                return cachedRow->second;
+            }
+            // Not in the cache: the rel was inserted after the list was cached, so scan.
+        }
+    }
+    std::vector<std::pair<offset_t, RowLocation>> scannedRows;
     DataChunk scanChunk(1);
     // RelID output vector.
     scanChunk.insert(0, std::make_shared<ValueVector>(LogicalType::INTERNAL_ID()));
@@ -202,17 +220,29 @@ std::pair<CSRNodeGroupScanSource, row_idx_t> RelTableData::findMatchingRow(Trans
         if (scanResult == NODE_GROUP_SCAN_EMPTY_RESULT) {
             break;
         }
+        const auto scanSource = scanState->nodeGroupScanState->cast<CSRNodeGroupScanState>().source;
         for (auto i = 0u; i < scanState->outState->getSelVector().getSelSize(); i++) {
             const auto pos = scanState->outState->getSelVector()[i];
-            if (scannedIDVector->getValue<internalID_t>(pos).offset == relOffset) {
-                const auto rowIdxPos = scanState->rowIdxVector->state->getSelVector()[i];
-                matchingRowIdx = scanState->rowIdxVector->getValue<row_idx_t>(rowIdxPos);
-                source = scanState->nodeGroupScanState->cast<CSRNodeGroupScanState>().source;
-                break;
+            const auto rowIdxPos = scanState->rowIdxVector->state->getSelVector()[i];
+            const auto rowIdx = scanState->rowIdxVector->getValue<row_idx_t>(rowIdxPos);
+            const auto scannedRelOffset = scannedIDVector->getValue<internalID_t>(pos).offset;
+            scannedRows.emplace_back(scannedRelOffset, RowLocation{scanSource, rowIdx});
+            if (scannedRelOffset == relOffset) {
+                matchingRowIdx = rowIdx;
+                source = scanSource;
             }
         }
-        if (matchingRowIdx != INVALID_ROW_IDX) {
-            break;
+        // A short list stops at its match; a long one is scanned to its end to be cached.
+        if (matchingRowIdx != INVALID_ROW_IDX &&
+            scannedRows.size() < ROW_LOOKUP_CACHE_MIN_LIST_SIZE) {
+            return {source, matchingRowIdx};
+        }
+    }
+    if (scannedRows.size() >= ROW_LOOKUP_CACHE_MIN_LIST_SIZE) {
+        std::unique_lock lck{rowLookupMtx};
+        if (rowLookupTransactionID == transaction->getID()) {
+            rowLookupCache[boundNodeOffset] =
+                std::unordered_map<offset_t, RowLocation>(scannedRows.begin(), scannedRows.end());
         }
     }
     return {source, matchingRowIdx};
