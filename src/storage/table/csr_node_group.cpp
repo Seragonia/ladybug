@@ -1,7 +1,9 @@
 #include "storage/table/csr_node_group.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
+#include <thread>
 #include <vector>
 
 #include "common/constants.h"
@@ -1172,9 +1174,7 @@ void CSRNodeGroup::checkpointInMemAndOnDisk(const UniqLock& lock, NodeGroupCheck
         persistentChunkGroup = nullptr;
     } else {
         DASSERT(csrState.newHeader->sanityCheck());
-        for (auto i = 0u; i < csrState.columnIDs.size(); i++) {
-            checkpointColumn(lock, i, csrState, regionsToCheckpoint);
-        }
+        checkpointColumns(lock, csrState, regionsToCheckpoint);
         checkpointCSRHeaderColumns(csrState);
         persistentChunkGroup = createNewPersistentChunkGroup(
             persistentChunkGroup->cast<ChunkedCSRNodeGroup>(), csrState);
@@ -1207,6 +1207,42 @@ void CSRNodeGroup::redistributeCSRRegions(const CSRNodeGroupCheckpointState& csr
         csrState.newHeader->populateStartCSROffsetsFromLength(true /* leaveGaps */);
     csrState.newHeader->populateEndCSROffsetFromStartAndLength();
     csrState.newHeader->finalizeCSRRegionEndOffsets(rightCSROffsetOfRegions);
+}
+
+void CSRNodeGroup::checkpointColumns(const UniqLock& lock,
+    const CSRNodeGroupCheckpointState& csrState, const std::vector<CSRRegion>& regions) const {
+    const auto numColumns = csrState.columnIDs.size();
+    // A group pinned by a scan queues page frees in a thread-local deferral, which is not
+    // thread-safe: it is rewritten one column at a time.
+    if (numColumns < 2 || PageReclaimDeferral::current() != nullptr) {
+        for (auto i = 0u; i < numColumns; i++) {
+            checkpointColumn(lock, i, csrState, regions);
+        }
+        return;
+    }
+    // Node groups are checkpointed one after another, so a large merge (a COPY into populated
+    // groups) used one core. Its columns are independent: rewrite them in parallel. Only one
+    // group runs at a time, so its shadow-file savepoint still covers just its own pages.
+    std::vector<std::exception_ptr> errors(numColumns);
+    std::vector<std::thread> workers;
+    workers.reserve(numColumns);
+    for (auto i = 0u; i < numColumns; i++) {
+        workers.emplace_back([&, i] {
+            try {
+                checkpointColumn(lock, i, csrState, regions);
+            } catch (...) {
+                errors[i] = std::current_exception();
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    for (auto& error : errors) {
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
 }
 
 void CSRNodeGroup::checkpointColumn(const UniqLock& lock, idx_t columnIdx,
