@@ -11,8 +11,10 @@
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "common/enums/storage_format.h"
+#include "common/exception/internal.h"
 #include "common/system_config.h"
 #include "graph_test/private_graph_test.h"
+#include "optimizer/remove_unnecessary_distinct_optimizer.h"
 #include "planner/join_order/cost_model.h"
 #include "planner/operator/logical_filter.h"
 #include "planner/operator/logical_intersect.h"
@@ -413,6 +415,98 @@ TEST_F(OptimizerTest, IntersectBuildSideMasksProbeScan) {
         taggedMaskers);
     EXPECT_EQ(taggedMaskers.size(), 1u);
     EXPECT_EQ(getCount(*conn->query(taggedQuery)), 16);
+}
+
+// LDBC IC14's reply-to-comment leg. Joining pa's comments with pb's comments on pb before the
+// reply edge builds their cross product for every pair; the leg has to intersect instead.
+TEST_F(OptimizerTest, CorrelatedReplyLegIntersects) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE XPerson(id INT64, PRIMARY KEY(id));"
+                            "CREATE NODE TABLE XComment(id INT64, PRIMARY KEY(id));"
+                            "CREATE REL TABLE XHasCreator(FROM XComment TO XPerson, MANY_ONE);"
+                            "CREATE REL TABLE XReplyOf(FROM XComment TO XComment, MANY_ONE);"
+                            "UNWIND range(0, 999) AS i CREATE (:XPerson {id: i});"
+                            "UNWIND range(0, 19999) AS i CREATE (:XComment {id: i});")
+                    ->isSuccess());
+    // Person p writes comments p, p + 1000, ..., p + 19000. The ten from p + 10000 on reply to a
+    // comment of person p + 1.
+    ASSERT_TRUE(conn->query("UNWIND range(0, 19999) AS i "
+                            "MATCH (c:XComment {id: i}), (p:XPerson {id: i % 1000}) "
+                            "CREATE (c)-[:XHasCreator]->(p);"
+                            "UNWIND range(10000, 19999) AS i "
+                            "MATCH (c:XComment {id: i}), (r:XComment {id: i - 9999}) "
+                            "CREATE (c)-[:XReplyOf]->(r);")
+                    ->isSuccess());
+    const auto query = "UNWIND [[1, 2], [5, 9]] AS pair "
+                       "MATCH (pa:XPerson) WHERE pa.id = pair[1] "
+                       "MATCH (pb:XPerson) WHERE pb.id = pair[2] "
+                       "OPTIONAL MATCH (pa)<-[:XHasCreator]-(c:XComment)-[:XReplyOf]->(:XComment)"
+                       "-[:XHasCreator]->(pb) "
+                       "RETURN pa.id, count(c) ORDER BY pa.id";
+    auto plan = TestRunner::getLogicalPlan(query, *conn);
+    std::vector<planner::LogicalOperator*> intersects;
+    collectOperators(plan->getLastOperator().get(), planner::LogicalOperatorType::INTERSECT,
+        intersects);
+    EXPECT_EQ(intersects.size(), 1u);
+    auto result = conn->query(query);
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNumTuples(), 2u);
+    auto row = result->getNext();
+    EXPECT_EQ(row->getValue(0)->getValue<int64_t>(), 1);
+    EXPECT_EQ(row->getValue(1)->getValue<int64_t>(), 10);
+    row = result->getNext();
+    EXPECT_EQ(row->getValue(0)->getValue<int64_t>(), 5);
+    EXPECT_EQ(row->getValue(1)->getValue<int64_t>(), 0);
+    // c.id is not read by the bare scan an intersect build side starts with, so c must still
+    // be joined with its own scan.
+    auto withProperty = conn->query("UNWIND [[1, 2]] AS pair "
+                                    "MATCH (pa:XPerson) WHERE pa.id = pair[1] "
+                                    "MATCH (pb:XPerson) WHERE pb.id = pair[2] "
+                                    "OPTIONAL MATCH (pa)<-[:XHasCreator]-(c:XComment)"
+                                    "-[:XReplyOf]->(:XComment)-[:XHasCreator]->(pb) "
+                                    "RETURN min(c.id), max(c.id)");
+    ASSERT_TRUE(withProperty->isSuccess()) << withProperty->getErrorMessage();
+    row = withProperty->getNext();
+    EXPECT_EQ(row->getValue(0)->getValue<int64_t>(), 10001);
+    EXPECT_EQ(row->getValue(1)->getValue<int64_t>(), 19001);
+}
+
+// LDBC q30's shape outside a subquery: the probe starts from the post scan, which the reply
+// build side masks. Counting the build side's bare post scan as a match moves the probe to the
+// person scan and loses that mask.
+TEST_F(OptimizerTest, PlainMatchIntersectKeepsMaskedPostScan) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE QPerson(id INT64, PRIMARY KEY(id));"
+                            "CREATE NODE TABLE QPost(id INT64, PRIMARY KEY(id));"
+                            "CREATE NODE TABLE QComment(id INT64, PRIMARY KEY(id));"
+                            "CREATE REL TABLE QPostCreator(FROM QPost TO QPerson, MANY_ONE);"
+                            "CREATE REL TABLE QCommentCreator(FROM QComment TO QPerson, MANY_ONE);"
+                            "CREATE REL TABLE QReplyOf(FROM QComment TO QPost, MANY_ONE);"
+                            "UNWIND range(0, 99) AS i CREATE (:QPerson {id: i});"
+                            "UNWIND range(0, 9999) AS i CREATE (:QPost {id: i});"
+                            "UNWIND range(0, 19999) AS i CREATE (:QComment {id: i});")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(0, 9999) AS i "
+                            "MATCH (p:QPost {id: i}), (a:QPerson {id: i % 100}) "
+                            "CREATE (p)-[:QPostCreator]->(a);"
+                            "UNWIND range(0, 19999) AS i "
+                            "MATCH (m:QComment {id: i}), (a:QPerson {id: (i * 7) % 100}) "
+                            "CREATE (m)-[:QCommentCreator]->(a);"
+                            "UNWIND range(0, 9999) AS i "
+                            "MATCH (m:QComment {id: i}), (p:QPost {id: (i * 3) % 10000}) "
+                            "CREATE (m)-[:QReplyOf]->(p);")
+                    ->isSuccess());
+    const auto query = "MATCH (m:QComment)-[:QCommentCreator]->(a:QPerson), "
+                       "(m)-[:QReplyOf]->(post:QPost)-[:QPostCreator]->(a) RETURN count(*)";
+    auto plan = TestRunner::getLogicalPlan(query, *conn);
+    std::vector<planner::LogicalOperator*> intersects;
+    collectOperators(plan->getLastOperator().get(), planner::LogicalOperatorType::INTERSECT,
+        intersects);
+    EXPECT_EQ(intersects.size(), 1u);
+    std::vector<planner::LogicalOperator*> maskers;
+    collectOperators(plan->getLastOperator().get(), planner::LogicalOperatorType::SEMI_MASKER,
+        maskers);
+    ASSERT_EQ(maskers.size(), 1u);
+    EXPECT_EQ(maskers[0]->constCast<planner::LogicalSemiMasker>().getKey()->toString(), "post._ID");
+    EXPECT_EQ(getCount(*conn->query(query)), 400);
 }
 
 TEST_F(OptimizerTest, IndexScanTest) {
@@ -1205,7 +1299,7 @@ TEST_F(OptimizerTest, RemoveUnnecessaryOrderByBeforeCountStar) {
     // COUNT(*) doesn't depend on ordering.
     //
     // Query: MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 RETURN count(*)
-    // Expected plan: AGGREGATE -> PROJECTION -> LIMIT -> ... (no ORDER BY)
+    // Expected plan: AGGREGATE -> PROJECTION -> LIMIT -> MULTIPLICITY_REDUCER -> ... (no ORDER BY)
 
     auto q1 = "MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 RETURN count(*)";
     auto plan1 = getRoot(q1);
@@ -1227,6 +1321,19 @@ TEST_F(OptimizerTest, RemoveUnnecessaryOrderByBeforeCountStar) {
     ASSERT_TRUE(plan3 != nullptr);
 }
 
+TEST_F(OptimizerTest, KeepOrderByBeforeAggregateOfKeptRows) {
+    // The ORDER BY decides which rows its LIMIT keeps, and these aggregates read them.
+    for (auto query : {"MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 RETURN sum(n.age)",
+             "MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 RETURN count(n.age)",
+             "MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 RETURN count(*), collect(n.ID)",
+             "MATCH (n:person) WITH n ORDER BY n.ID LIMIT 5 WHERE n.age > 30 RETURN count(*)"}) {
+        auto plan = getRoot(query);
+        ASSERT_TRUE(
+            hasOperatorType(plan->getLastOperator().get(), planner::LogicalOperatorType::ORDER_BY))
+            << query;
+    }
+}
+
 TEST_F(OptimizerTest, RemoveUnnecessaryDistinctOnPrimaryKey) {
     // Issue #721: DISTINCT on a primary-key column should be removed since
     // the primary key is already unique.
@@ -1239,6 +1346,14 @@ TEST_F(OptimizerTest, RemoveUnnecessaryDistinctOnPrimaryKey) {
     ASSERT_FALSE(
         hasOperatorType(plan1->getLastOperator().get(), planner::LogicalOperatorType::DISTINCT))
         << "DISTINCT on primary key should be removed";
+    // A removed DISTINCT leaves no FLATTEN, so the scan stays vectorized.
+    ASSERT_FALSE(
+        hasOperatorType(plan1->getLastOperator().get(), planner::LogicalOperatorType::FLATTEN));
+    auto plan4 = getRoot("MATCH (n:person) WITH DISTINCT n.ID AS id RETURN count(*)");
+    ASSERT_FALSE(
+        hasOperatorType(plan4->getLastOperator().get(), planner::LogicalOperatorType::DISTINCT));
+    ASSERT_FALSE(
+        hasOperatorType(plan4->getLastOperator().get(), planner::LogicalOperatorType::FLATTEN));
 
     // Sanity check: DISTINCT on a non-primary-key column should be kept
     auto q2 = "MATCH (n:person) RETURN DISTINCT n.age";
@@ -1253,6 +1368,24 @@ TEST_F(OptimizerTest, RemoveUnnecessaryDistinctOnPrimaryKey) {
     auto q3 = "MATCH (n:person) RETURN DISTINCT n.ID, n.age";
     auto plan3 = getRoot(q3);
     ASSERT_TRUE(plan3 != nullptr);
+}
+
+TEST_F(OptimizerTest, RemoveUnnecessaryDistinctRequiresFlatPlan) {
+    // getRoot returns the optimized plan, so FactorizationRewriter has placed its flattens.
+    auto plan = getRoot("MATCH (a:person)-[:knows]->(b:person) RETURN DISTINCT a.fName, b.fName");
+    ASSERT_TRUE(
+        hasOperatorType(plan->getLastOperator().get(), planner::LogicalOperatorType::FLATTEN));
+    try {
+        optimizer::RemoveUnnecessaryDistinctOptimizer().rewrite(plan.get());
+        FAIL() << "the pass accepted a factorized plan";
+    } catch (const common::InternalException& e) {
+#if defined(RUNTIME_CHECKS) || !defined(NDEBUG)
+        // The entry check reports it, not LogicalFlatten::computeFlatSchema further down.
+        EXPECT_NE(std::string(e.what()).find("remove_unnecessary_distinct_optimizer.cpp"),
+            std::string::npos)
+            << e.what();
+#endif
+    }
 }
 
 TEST_F(OptimizerTest, CountPrimaryKeyReadsInternalID) {
