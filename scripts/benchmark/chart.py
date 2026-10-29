@@ -13,10 +13,16 @@ latest = {}
 for line in open(results_path):
     r = json.loads(line)
     latest[(r["data"], r["engine"], r["phase"])] = r
+# Name each data set by its size: the edges a successful build loaded.
+sizes = {r["data"]: r["edges"] for r in latest.values() if r["phase"] == "load" and r.get("ok") and r.get("edges")}
+latest = {(f"{sizes.get(d, 0) / 1e6:,.0f}M edges" if d in sizes else d, e, p): r for (d, e, p), r in latest.items()}
 
 rows = []  # (data, label, unit, upstream value or None, fork value or None, upstream error, fork error)
-for data in sorted({k[0] for k in latest}):
+for data in sorted({k[0] for k in latest}, key=lambda d: float(d.split('M')[0].replace(',', '')) if d[0].isdigit() else 0):
     def get(engine, phase):
+        # After a failed build, the other phases ran on a partial graph: not comparable.
+        if phase != "load" and not latest.get((data, engine, "load"), {}).get("ok"):
+            return {"ok": False, "error": "build failed"}
         return latest.get((data, engine, phase), {})
 
     for phase, label in (("load", "build graph"), ("extend", "extend +10% edges"), ("delete", "delete ~1% edges")):

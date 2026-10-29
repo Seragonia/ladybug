@@ -24,17 +24,54 @@ A fork of [Ladybug](https://github.com/LadybugDB/ladybug) (formerly [Kuzu](https
 billions of relationships on a single machine, without running a server. Query behaviour and the Cypher dialect are
 unchanged; everything upstream offers still works.
 
-| | Upstream Ladybug | This fork |
-|---|---|---|
-| Load 330M relationships, 8 GB buffer pool | fails after 28 min ("Buffer pool is full", 16.7 GB RSS) | ~7 min, 8 GB RSS |
-| Extend that table by 33M relationships | 321 s | 287 s |
-| Delete ~3.3M relationships by predicate (skewed in-degree) | 1,559 s | 585 s |
-| Full-text search and graph algorithms offline | need `INSTALL` from the network; `LOAD algo` fails on Linux | linked in, no download |
-| `import kuzu` and `import ladybug` in one process | import error, then crash at exit | works |
+![Fork vs upstream Ladybug](scripts/benchmark/results.svg)
 
-Measured on a synthetic transaction graph (11.8M nodes, 330M relationships with super-nodes) on 16 vCPU / 24 GB.
-The upstream column is the same source tree without this fork's commits; since upstream cannot load this table, its
-extend and delete numbers are measured with only the bucketed load applied.
+At 330M relationships with an 8 GB buffer pool, upstream Ladybug cannot build the graph ("buffer pool is full", 13.5 GB
+RSS); this fork builds, extends and edits it. At 33M relationships, both build; the fork uses half the memory to build
+and extends and deletes about 3x faster. Query speed is unchanged: the query engine is upstream's.
+
+<details><summary>All numbers</summary>
+
+| Data | Measure | Upstream | Fork | Speed-up |
+|---|---|---|---|---|
+| 33M edges | build graph | 14.0 s | 27.1 s | 0.5x |
+| 33M edges | build graph: peak RAM | 6.17 GB | 2.89 GB | 2.1x |
+| 33M edges | extend +10% edges | 28.2 s | 8.54 s | 3.3x |
+| 33M edges | extend +10% edges: peak RAM | 2.75 GB | 3.71 GB | 0.7x |
+| 33M edges | delete ~1% edges | 42.4 s | 12.9 s | 3.3x |
+| 33M edges | delete ~1% edges: peak RAM | 2.93 GB | 3.84 GB | 0.8x |
+| 33M edges | point lookup | 0.10 ms | 0.07 ms | 1.4x |
+| 33M edges | 1-hop out | 0.21 ms | 0.20 ms | 1.0x |
+| 33M edges | 1-hop in | 0.17 ms | 0.16 ms | 1.1x |
+| 33M edges | 2-hop count | 0.63 ms | 0.62 ms | 1.0x |
+| 33M edges | super-node in | 4.10 ms | 3.90 ms | 1.1x |
+| 33M edges | filtered scan | 142 ms | 140 ms | 1.0x |
+| 33M edges | group by | 156 ms | 164 ms | 1.0x |
+| 33M edges | super-node 2-hop | 127 ms | 113 ms | 1.1x |
+| 330M edges | build graph | failed | 1,070 s | upstream fails |
+| 330M edges | build graph: peak RAM | 13.5 GB | 7.44 GB | 1.8x |
+| 330M edges | extend +10% edges | failed | 220 s | upstream fails |
+| 330M edges | extend +10% edges: peak RAM | failed | 11.4 GB | upstream fails |
+| 330M edges | delete ~1% edges | failed | 327 s | upstream fails |
+| 330M edges | delete ~1% edges: peak RAM | failed | 16.0 GB | upstream fails |
+| 330M edges | point lookup | failed | 2.61 ms | upstream fails |
+| 330M edges | 1-hop out | failed | 31.6 ms | upstream fails |
+| 330M edges | 1-hop in | failed | 7.10 ms | upstream fails |
+| 330M edges | 2-hop count | failed | 5.28 ms | upstream fails |
+| 330M edges | super-node in | failed | 32.8 ms | upstream fails |
+| 330M edges | filtered scan | failed | 2,004 ms | upstream fails |
+| 330M edges | group by | failed | 3,335 ms | upstream fails |
+| 330M edges | super-node 2-hop | failed | 2,155 ms | upstream fails |
+
+</details>
+
+Synthetic transaction graph (`scripts/benchmark/gen.py`: 30% of transfers to skewed super-nodes), 8 GB buffer pool,
+16 vCPU / 24 GB RAM, upstream = the `ladybug` 0.22.0 wheel from PyPI. Reproduce with `scripts/benchmark/run.sh`;
+raw results in `scripts/benchmark/results.jsonl`. The fork's peak RAM includes the bucketed loader's DuckDB (capped
+at 3 GB) running in the same process.
+
+Also in this fork: full-text search and graph algorithms work offline (linked in; upstream needs `INSTALL` from the
+network and `LOAD algo` fails on Linux), and `import kuzu` and `import ladybug` work in one process.
 
 ## What changed
 
