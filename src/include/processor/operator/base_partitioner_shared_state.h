@@ -52,6 +52,8 @@ struct LBUG_API PartitionerSharedState {
         common::idx_t numPartitioners, const main::ClientContext* clientContext);
 
     common::partition_idx_t getNextPartition(common::idx_t partitioningIdx);
+    // True when the input has no rel for this node group, so the COPY can leave it untouched.
+    virtual bool isPartitionEmpty(common::idx_t, common::partition_idx_t) const { return false; }
 
     common::partition_idx_t getNumPartitions(common::idx_t partitioningIdx) const {
         return numPartitions[partitioningIdx];

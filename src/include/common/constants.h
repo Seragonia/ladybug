@@ -114,6 +114,14 @@ struct CopyConstants {
     static constexpr const char* FROM_OPTION_NAME = "FROM";
     static constexpr const char* TO_OPTION_NAME = "TO";
 
+    // Bucketed rel COPY. DIRECTION='fwd'|'bwd' builds the CSR of one direction only, and only the
+    // node groups the input touches. RAW_OFFSETS=true reads the first three input columns as the
+    // source node offset, the destination node offset and the rel offset instead of looking up
+    // primary keys. Copying one bucket of node-group ranges per COPY bounds memory by the bucket.
+    static constexpr const char* REL_DIRECTION_OPTION_NAME = "DIRECTION";
+    static constexpr const char* RAW_OFFSETS_OPTION_NAME = "RAW_OFFSETS";
+    static constexpr const char* RAW_REL_OFFSET_COLUMN_NAME = "_rel_offset";
+
     static constexpr const char* BOOL_CSV_PARSING_OPTIONS[] = {"HEADER", "PARALLEL",
         "MULTILINE_PARALLEL", "LIST_UNBRACED", "AUTODETECT", "AUTO_DETECT",
         CopyConstants::IGNORE_ERRORS_OPTION_NAME, CopyConstants::SKIP_DUPLICATE_PK_OPTION_NAME};

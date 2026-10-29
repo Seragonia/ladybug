@@ -87,6 +87,7 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapPartitioner(
     PartitionerInfo partitionerInfo;
     partitionerInfo.relOffsetDataPos =
         getDataPos(*logicalPartitioner.getInfo().offset, *outFSchema);
+    partitionerInfo.rawOffsets = extraInfo.rawOffsets;
     partitionerInfo.infos.reserve(logicalPartitioner.getInfo().getNumInfos());
     for (auto i = 0u; i < logicalPartitioner.getInfo().getNumInfos(); i++) {
         partitionerInfo.infos.emplace_back(logicalPartitioner.getInfo().getInfo(i).keyIdx,
@@ -148,11 +149,15 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapCopyRelFrom(
                 ->constCast<RelGroupCatalogEntry>();
         directions = relGroupEntry.getRelDataDirections();
     }
+    if (!extraInfo.directions.empty()) {
+        directions = extraInfo.directions;
+    }
 
     auto sink = std::make_unique<DummySimpleSink>(fTable, getOperatorID());
-    for (auto direction : directions) {
+    for (auto i = 0u; i < directions.size(); i++) {
         auto insertInfo = std::make_unique<RelBatchInsertInfo>(copyFromInfo->tableName,
-            copyVector(warningColumnTypes), fromTableID, toTableID, direction);
+            copyVector(warningColumnTypes), fromTableID, toTableID, directions[i]);
+        insertInfo->partitioningIdx = i;
         auto printInfo = std::make_unique<RelBatchInsertPrintInfo>(copyFromInfo->tableName);
         auto progress = std::make_shared<RelBatchInsertProgressSharedState>();
         auto batchInsert = std::make_unique<RelBatchInsert>(std::move(insertInfo),

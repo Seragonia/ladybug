@@ -87,6 +87,10 @@ void Partitioner::initGlobalStateInternal(ExecutionContext* context) {
                                   ->constCast<catalog::RelGroupCatalogEntry>();
         auto relEntryInfo = relGroupEntry.getRelEntryInfo(fromTableID, toTableID);
         sharedState->relTable = storageManager->getTable(relEntryInfo->oid)->ptrCast<RelTable>();
+        // A COPY building the BWD direction only has a single partitioning, keyed by dst.
+        if (info.infos.size() == 1 && info.infos[0].keyIdx == 1) {
+            std::swap(sharedState->srcNodeTable, sharedState->dstNodeTable);
+        }
     }
     sharedState->initialize(dataInfo.columnTypes, info.infos.size(), clientContext);
 }
@@ -133,10 +137,20 @@ void Partitioner::executeInternal(ExecutionContext* context) {
         DASSERT(dataInfo.columnEvaluators.size() >= 1);
         const auto numRels = relOffsetVector->state->getSelVector().getSelSize();
         evaluateExpressions(numRels);
-        auto currentRelOffset = sharedState->relTable->reserveRelOffsets(numRels);
-        for (auto i = 0u; i < numRels; i++) {
-            const auto pos = relOffsetVector->state->getSelVector()[i];
-            relOffsetVector->setValue<offset_t>(pos, currentRelOffset++);
+        if (info.rawOffsets) {
+            const auto& rawRelOffsets = *dataInfo.columnEvaluators[2]->resultVector;
+            offset_t end = 0;
+            for (auto i = 0u; i < rawRelOffsets.state->getSelVector().getSelSize(); i++) {
+                const auto pos = rawRelOffsets.state->getSelVector()[i];
+                end = std::max(end, rawRelOffsets.getValue<offset_t>(pos) + 1);
+            }
+            sharedState->relTable->reserveRelOffsetsBelow(end);
+        } else {
+            auto currentRelOffset = sharedState->relTable->reserveRelOffsets(numRels);
+            for (auto i = 0u; i < numRels; i++) {
+                const auto pos = relOffsetVector->state->getSelVector()[i];
+                relOffsetVector->setValue<offset_t>(pos, currentRelOffset++);
+            }
         }
         for (auto partitioningIdx = 0u; partitioningIdx < info.infos.size(); partitioningIdx++) {
             auto& partitionInfo = info.infos[partitioningIdx];

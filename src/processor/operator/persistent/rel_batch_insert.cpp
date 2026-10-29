@@ -88,8 +88,11 @@ void RelBatchInsert::initGlobalStateInternal(ExecutionContext* context) {
         info->columnTypes.push_back(type.copy());
         info->warningDataColumns.push_back(dataColumnIdx++);
     }
-    relBatchInsertInfo->partitioningIdx =
-        relBatchInsertInfo->direction == RelDataDirection::FWD ? 0 : 1;
+    // A COPY building one direction only partitions once, so its mapper sets the index.
+    if (relBatchInsertInfo->partitioningIdx == UINT64_MAX) {
+        relBatchInsertInfo->partitioningIdx =
+            relBatchInsertInfo->direction == RelDataDirection::FWD ? 0 : 1;
+    }
     relBatchInsertInfo->boundNodeOffsetColumnID =
         relBatchInsertInfo->direction == RelDataDirection::FWD ? 0 : 1;
     // Init shared state
@@ -115,6 +118,13 @@ void RelBatchInsert::executeInternal(ExecutionContext* context) {
         if (relLocalState->nodeGroupIdx == INVALID_PARTITION_IDX) {
             // No more partitions left in the partitioning buffer.
             break;
+        }
+        // Touching a node group the input has no rel for would rewrite it for nothing: an
+        // incremental or bucketed COPY then costs what it inserts, not the size of the table.
+        if (partitionerSharedState->isPartitionEmpty(relInfo->partitioningIdx,
+                relLocalState->nodeGroupIdx)) {
+            ++progressSharedState->partitionsDone;
+            continue;
         }
         if (!localState->chunkedGroup) {
             initLocalStateForFirstPartition(context);
@@ -260,9 +270,7 @@ void RelBatchInsert::checkRelMultiplicityConstraint(const RelGroupCatalogEntry& 
 
 void RelBatchInsert::finalizeInternal(ExecutionContext* context) {
     const auto relInfo = info->ptrCast<RelBatchInsertInfo>();
-    if (relInfo->direction == RelDataDirection::FWD) {
-        DASSERT(relInfo->partitioningIdx == 0);
-
+    if (relInfo->partitioningIdx == 0) {
         auto outputMsg = std::format("{} tuples have been copied to the {} table.",
             sharedState->getNumRows(), relInfo->tableName);
         auto clientContext = context->clientContext;

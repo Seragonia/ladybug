@@ -6,6 +6,7 @@
 #include "binder/expression/expression.h"
 #include "binder/expression/literal_expression.h"
 #include "common/enums/column_evaluate_type.h"
+#include "common/enums/rel_direction.h"
 #include "common/enums/table_type.h"
 #include "common/partition_routing.h"
 #include "index_look_up_info.h"
@@ -81,6 +82,10 @@ struct ExtraBoundCopyRelInfo final : ExtraBoundCopyFromInfo {
     // we need to manually change offset(INT64) type to internal ID type.
     std::vector<common::idx_t> internalIDColumnIndices;
     std::vector<IndexLookupInfo> infos;
+    // Directions this COPY builds. Empty means every storage direction of the table.
+    std::vector<common::RelDataDirection> directions;
+    // The input carries node and rel offsets instead of primary keys (COPY option RAW_OFFSETS).
+    bool rawOffsets = false;
 
     ExtraBoundCopyRelInfo(std::string fromTableName, std::string toTableName,
         std::vector<common::idx_t> internalIDColumnIndices, std::vector<IndexLookupInfo> infos)
@@ -88,7 +93,8 @@ struct ExtraBoundCopyRelInfo final : ExtraBoundCopyFromInfo {
           internalIDColumnIndices{std::move(internalIDColumnIndices)}, infos{std::move(infos)} {}
     ExtraBoundCopyRelInfo(const ExtraBoundCopyRelInfo& other)
         : fromTableName{other.fromTableName}, toTableName{other.toTableName},
-          internalIDColumnIndices{other.internalIDColumnIndices}, infos{other.infos} {}
+          internalIDColumnIndices{other.internalIDColumnIndices}, infos{other.infos},
+          directions{other.directions}, rawOffsets{other.rawOffsets} {}
 
     std::unique_ptr<ExtraBoundCopyFromInfo> copy() const override {
         return std::make_unique<ExtraBoundCopyRelInfo>(*this);

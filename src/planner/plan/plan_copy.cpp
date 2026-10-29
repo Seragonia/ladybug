@@ -117,7 +117,12 @@ LogicalPlan Planner::planCopyRelFrom(const BoundCopyFromInfo* info) {
                                         ->constCast<RelGroupCatalogEntry>();
         directions = relGroupEntry.getRelDataDirections();
     }
-    appendIndexScan(extraInfo, plan);
+    if (!extraInfo.directions.empty()) {
+        directions = extraInfo.directions;
+    }
+    if (!extraInfo.rawOffsets) {
+        appendIndexScan(extraInfo, plan);
+    }
     appendPartitioner(*info, plan, directions);
     appendCopyFrom(*info, plan);
     return plan;

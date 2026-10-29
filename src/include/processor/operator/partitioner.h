@@ -70,6 +70,12 @@ struct CopyPartitionerSharedState : public PartitionerSharedState {
         partitioningBuffer->loadFromDisk(mm);
         return partitioningBuffer;
     }
+
+    bool isPartitionEmpty(common::idx_t partitioningIdx,
+        common::partition_idx_t partitionIdx) const override {
+        const auto& partition = partitioningBuffers[partitioningIdx]->partitions[partitionIdx];
+        return partition && partition->getNumChunkedGroups() == 0;
+    }
 };
 
 struct PartitionerLocalState {
@@ -122,9 +128,12 @@ private:
 struct PartitionerInfo {
     DataPos relOffsetDataPos;
     std::vector<PartitioningInfo> infos;
+    // Rel offsets come from the input (column 2) instead of being reserved here.
+    bool rawOffsets = false;
 
     PartitionerInfo() {}
-    PartitionerInfo(const PartitionerInfo& other) : relOffsetDataPos{other.relOffsetDataPos} {
+    PartitionerInfo(const PartitionerInfo& other)
+        : relOffsetDataPos{other.relOffsetDataPos}, rawOffsets{other.rawOffsets} {
         infos.reserve(other.infos.size());
         for (auto& otherInfo : other.infos) {
             infos.push_back(otherInfo.copy());

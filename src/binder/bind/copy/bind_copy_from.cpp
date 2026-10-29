@@ -222,7 +222,8 @@ std::unique_ptr<BoundStatement> Binder::bindCopyNodeFrom(const Statement& statem
 static options_t getScanSourceOptions(const CopyFrom& copyFrom) {
     options_t options;
     static case_insensitve_set_t copyFromPairsOptions = {CopyConstants::FROM_OPTION_NAME,
-        CopyConstants::TO_OPTION_NAME};
+        CopyConstants::TO_OPTION_NAME, CopyConstants::REL_DIRECTION_OPTION_NAME,
+        CopyConstants::RAW_OFFSETS_OPTION_NAME};
     for (auto& option : copyFrom.getParsingOptions()) {
         if (copyFromPairsOptions.contains(option.first)) {
             continue;
@@ -236,7 +237,7 @@ BoundCopyFromInfo Binder::bindCopyRelFromInfo(std::string tableName,
     const std::vector<PropertyDefinition>& properties, const BaseScanSource* source,
     const options_t& parsingOptions, const std::vector<std::string>& expectedColumnNames,
     const std::vector<LogicalType>& expectedColumnTypes, const NodeTableCatalogEntry* fromTable,
-    const NodeTableCatalogEntry* toTable) {
+    const NodeTableCatalogEntry* toTable, bool rawOffsets) {
     if (getBoolCopyOption(parsingOptions, CopyConstants::SKIP_DUPLICATE_PK_OPTION_NAME,
             CopyConstants::DEFAULT_SKIP_DUPLICATE_PK)) {
         throw BinderException("IGNORE_ERRORS=true (DUPLICATE_PK_ONLY) is only supported for COPY "
@@ -251,6 +252,14 @@ BoundCopyFromInfo Binder::bindCopyRelFromInfo(std::string tableName,
     auto srcOffset = createVariable(std::string(InternalKeyword::SRC_OFFSET), LogicalType::INT64());
     auto dstOffset = createVariable(std::string(InternalKeyword::DST_OFFSET), LogicalType::INT64());
     expression_vector columnExprs{srcOffset, dstOffset, offset};
+    if (rawOffsets) {
+        // The first three input columns already hold the src, dst and rel offsets.
+        for (auto i = 0u; i < 3; ++i) {
+            columnExprs[i] = columns[i]->getDataType() == LogicalType::INT64() ?
+                                 columns[i] :
+                                 expressionBinder.forceCast(columns[i], LogicalType::INT64());
+        }
+    }
     std::vector<ColumnEvaluateType> evaluateTypes{ColumnEvaluateType::REFERENCE,
         ColumnEvaluateType::REFERENCE, ColumnEvaluateType::REFERENCE};
     for (auto i = 1u; i < properties.size(); ++i) { // skip internal ID
@@ -277,9 +286,13 @@ BoundCopyFromInfo Binder::bindCopyRelFromInfo(std::string tableName,
     auto dstLookUpInfo =
         IndexLookupInfo(toTable->getTableID(), dstOffset, dstKey, warningDataExprs);
     auto lookupInfos = std::vector<IndexLookupInfo>{srcLookUpInfo, dstLookUpInfo};
+    if (rawOffsets) {
+        lookupInfos.clear();
+    }
     auto internalIDColumnIndices = std::vector<idx_t>{0, 1, 2};
     auto extraCopyRelInfo = std::make_unique<ExtraBoundCopyRelInfo>(fromTable->getName(),
         toTable->getName(), internalIDColumnIndices, lookupInfos);
+    extraCopyRelInfo->rawOffsets = rawOffsets;
     return BoundCopyFromInfo(tableName, TableType::REL, boundSource->copy(), offset,
         std::move(columnExprs), std::move(evaluateTypes), std::move(extraCopyRelInfo), false);
 }
@@ -309,11 +322,39 @@ std::unique_ptr<BoundStatement> Binder::bindCopyRelFrom(const Statement& stateme
     std::vector<LogicalType> expectedColumnTypes;
     bindExpectedRelColumns(relGroupEntry, *fromTable, *toTable, copyStatement.getCopyColumnInfo(),
         expectedColumnNames, expectedColumnTypes);
+    const auto& options = copyStatement.getParsingOptions();
+    const auto rawOffsets =
+        getBoolCopyOption(options, CopyConstants::RAW_OFFSETS_OPTION_NAME, false);
+    if (rawOffsets) {
+        expectedColumnTypes[0] = LogicalType::INT64();
+        expectedColumnTypes[1] = LogicalType::INT64();
+        expectedColumnNames.insert(expectedColumnNames.begin() + 2,
+            CopyConstants::RAW_REL_OFFSET_COLUMN_NAME);
+        expectedColumnTypes.insert(expectedColumnTypes.begin() + 2, LogicalType::INT64());
+    }
+    auto directions = relGroupEntry.getRelDataDirections();
+    if (options.contains(CopyConstants::REL_DIRECTION_OPTION_NAME)) {
+        auto direction = bindParsingOptions(options)
+                             .at(CopyConstants::REL_DIRECTION_OPTION_NAME)
+                             .getValue<std::string>();
+        StringUtils::toLower(direction);
+        if (direction != "fwd" && direction != "bwd") {
+            throw BinderException("COPY option DIRECTION must be 'fwd' or 'bwd'.");
+        }
+        auto wanted = direction == "fwd" ? RelDataDirection::FWD : RelDataDirection::BWD;
+        if (std::find(directions.begin(), directions.end(), wanted) == directions.end()) {
+            throw BinderException(std::format("Rel table {} does not store the {} direction.",
+                relGroupEntry.getName(), direction));
+        }
+        directions = {wanted};
+    }
     // Bind info
     auto boundCopyFromInfo =
         bindCopyRelFromInfo(relGroupEntry.getName(), relGroupEntry.getProperties(),
             copyStatement.getSource(), getScanSourceOptions(copyStatement), expectedColumnNames,
-            expectedColumnTypes, fromTable, toTable);
+            expectedColumnTypes, fromTable, toTable, rawOffsets);
+    static_cast<ExtraBoundCopyRelInfo&>(*boundCopyFromInfo.extraInfo).directions =
+        std::move(directions);
     return std::make_unique<BoundCopyFrom>(std::move(boundCopyFromInfo));
 }
 

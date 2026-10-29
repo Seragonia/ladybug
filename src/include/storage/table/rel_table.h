@@ -280,6 +280,11 @@ public:
         nextRelOffset += numRels;
         return currentRelOffset;
     }
+    // Keeps later reservations above rel offsets that a COPY took from its input.
+    void reserveRelOffsetsBelow(common::offset_t end) {
+        std::unique_lock xLck{relOffsetMtx};
+        nextRelOffset = std::max(nextRelOffset, end);
+    }
 
     void pushInsertInfo(const transaction::Transaction* transaction,
         common::RelDataDirection direction, const CSRNodeGroup& nodeGroup,

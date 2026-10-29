@@ -146,7 +146,7 @@ public:
         const std::vector<std::string>& expectedColumnNames,
         const std::vector<common::LogicalType>& expectedColumnTypes,
         const catalog::NodeTableCatalogEntry* fromTable,
-        const catalog::NodeTableCatalogEntry* toTable);
+        const catalog::NodeTableCatalogEntry* toTable, bool rawOffsets = false);
     std::unique_ptr<BoundStatement> bindCopyFromClause(const parser::Statement& statement);
     std::unique_ptr<BoundStatement> bindCopyNodeFrom(const parser::Statement& statement,
         catalog::NodeTableCatalogEntry& nodeEntry);
