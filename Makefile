@@ -205,6 +205,13 @@ nodejstest-deps: nodejs-deps nodejstest
 python:
 	$(call run-cmake-release, -DBUILD_PYTHON=TRUE -DBUILD_SHELL=FALSE)
 
+# Python module with fts and algo linked in, so they work without INSTALL or network (like Kuzu
+# 0.11.3's bundled extensions). algo is built without icebug, whose NetworKit library the module
+# does not ship; its own PAGE_RANK, WCC, SCC, LOUVAIN and K_CORE remain.
+python-bundled:
+	$(call run-cmake-release, -DBUILD_PYTHON=TRUE -DBUILD_SHELL=FALSE \
+		-DBUILD_EXTENSIONS="fts;algo" -DEXTENSION_STATIC_LINK_LIST="fts;algo" -DICEBUG_ENABLED=OFF)
+
 python-debug:
 	$(call run-cmake-debug, -DBUILD_PYTHON=TRUE)
 
