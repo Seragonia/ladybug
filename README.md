@@ -34,19 +34,18 @@ relationships on one machine, with a fixed amount of memory. Queries and Cypher 
 
 ## How
 
-Ladybug stores each relationship table as CSR adjacency lists (forward and backward), chunked in *node groups* of
-131,072 nodes. Upstream builds them with one COPY that keeps every relationship of both directions in memory, and
-rewrites every node group on any later COPY. The fork changes that:
+Ladybug stores each relationship twice: once grouped by source node (to follow it forward) and once grouped by
+destination node (to follow it backward). Nodes are stored in blocks of 131,072.
 
-| Change | Upstream | Fork | Why it wins |
+| | Upstream | Fork | Effect |
 |---|---|---|---|
-| **Bucketed COPY** | one COPY, both directions, whole table in memory | one COPY per range of node groups, one direction at a time (`DIRECTION`, `RAW_OFFSETS` COPY options) | memory is bounded by a bucket, not the table; each node group is written once |
-| **Key resolution** | primary-key hash-index lookup per relationship, inside the COPY | one streaming DuckDB join on **64-bit key hashes**, relationship ids taken from Parquet row positions | 4x smaller join tables than string keys, no materialized numbering: no spills |
-| **Pipelining** | — | backward buckets are split while the engine copies the forward ones | the two stages share the CPU instead of waiting on each other |
-| **Incremental COPY** | every node group rewritten | node groups with no new relationship skipped; new ones merged in contiguous runs; node groups checkpointed in parallel | adding data costs what it touches |
-| **Bulk DELETE** | one adjacency-list scan per deleted relationship (quadratic on busy nodes) | deletions batched per table, one scan per list for all its rows | linear instead of quadratic; ~3x faster in the benchmark |
-| **Concurrency fix** | shadow-page map read without its lock | read under the lock | parallel checkpoints no longer lose updates |
-| **Packaging** | FTS/algo downloaded at runtime; clashes with `kuzu` in one process | linked in; module-local bindings and `-Bsymbolic` | works offline, side by side with Kuzu |
+| **Loading relationships** | one big load that holds all relationships, both copies, in memory | many small loads, each for one range of node blocks and one direction | memory use depends on the slice size, not the graph size |
+| **Finding node ids** | looks every node key up in an index during the load | done once beforehand by DuckDB, matching keys as 64-bit numbers (hashes) instead of text | 4x less memory for the matching, so it stays in RAM and is fast |
+| **Preparing slices** | — | slices for the backward copy are prepared while the forward copy is being loaded | ~30% shorter build |
+| **Adding data later** | rewrites every node block | rewrites only the blocks that get new relationships, several at a time | cost follows the blocks you touch, not the whole graph |
+| **Bulk delete** | searches a node's relationship list once per deleted relationship (very slow on busy nodes) | reads each list once for all the deletions in it | ~3x faster |
+| **Bug fix** | a shared lookup table was read without its lock while saving | read with the lock | saving in parallel no longer loses data |
+| **Packaging** | full-text search and algorithms are downloaded at runtime; crashes next to Kuzu | built in; runs next to Kuzu | works offline |
 
 ## Use it
 
