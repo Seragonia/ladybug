@@ -27,8 +27,8 @@ unchanged; everything upstream offers still works.
 | | Upstream Ladybug | This fork |
 |---|---|---|
 | Load 330M relationships, 8 GB buffer pool | fails after 28 min ("Buffer pool is full", 16.7 GB RSS) | ~7 min, 8 GB RSS |
-| Extend that table by 33M relationships | 321 s | 205 s |
-| Delete ~3.3M relationships by predicate (skewed in-degree) | 1,559 s | 421 s |
+| Extend that table by 33M relationships | 321 s | 287 s |
+| Delete ~3.3M relationships by predicate (skewed in-degree) | 1,559 s | 585 s |
 | Full-text search and graph algorithms offline | need `INSTALL` from the network; `LOAD algo` fails on Linux | linked in, no download |
 | `import kuzu` and `import ladybug` in one process | import error, then crash at exit | works |
 
@@ -42,8 +42,7 @@ extend and delete numbers are measured with only the bucketed load applied.
   `RAW_OFFSETS=true` (take source, destination and relationship offsets from the input instead of looking up keys),
   plus a COPY that leaves untouched node groups alone. A loader can then copy one node-group-aligned bucket at a time,
   so memory is bounded by the bucket, not the table. See [`scripts/bucketed_load`](scripts/bucketed_load).
-- **Faster extend.** A COPY into populated node groups is merged at checkpoint in contiguous runs instead of row by row,
-  and the columns of a node group are rewritten in parallel.
+- **Faster extend.** A COPY into populated node groups is merged at checkpoint in contiguous runs instead of row by row.
 - **Faster bulk delete and update.** Long relationship lists are scanned once per transaction instead of once per
   deleted or updated relationship.
 - **Bundled extensions.** `make python-bundled` links `fts` and `algo` (PAGE_RANK, WCC, SCC, LOUVAIN, K_CORE) into the
