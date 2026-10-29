@@ -25,6 +25,12 @@ struct VectorVersionInfo {
     // We can even consider separating the insertion and deletion into two separate Vectors.
     std::unique_ptr<std::array<transaction_t, DEFAULT_VECTOR_CAPACITY>> insertedVersions;
     std::unique_ptr<std::array<transaction_t, DEFAULT_VECTOR_CAPACITY>> deletedVersions;
+    // Rows deleted at the single version `deletedRowsVersion`, when the vector has no
+    // `deletedVersions`. A vector's deletions mostly come from one transaction (a checkpoint and a
+    // reopen also give them one version), so this bitmap (256 bytes) stands in for the 16 KB
+    // array, which is built only once a second version shows up in the vector.
+    std::unique_ptr<std::array<uint64_t, DEFAULT_VECTOR_CAPACITY / 64>> deletedRows;
+    transaction_t deletedRowsVersion;
     // If all values in the Vector are inserted/deleted in the same transaction, we can use this to
     // avoid the allocation of `array`.
     transaction_t sameInsertionVersion;
@@ -39,7 +45,8 @@ struct VectorVersionInfo {
     DeletionStatus deletionStatus;
 
     VectorVersionInfo()
-        : sameInsertionVersion{INVALID_TRANSACTION}, sameDeletionVersion{INVALID_TRANSACTION},
+        : deletedRowsVersion{INVALID_TRANSACTION}, sameInsertionVersion{INVALID_TRANSACTION},
+          sameDeletionVersion{INVALID_TRANSACTION},
           numCommittedInsertions{0}, maxCommittedInsertion{0},
           insertionStatus{InsertionStatus::NO_INSERTED},
           deletionStatus{DeletionStatus::NO_DELETED} {}
@@ -83,6 +90,11 @@ struct VectorVersionInfo {
 private:
     void initInsertionVersionArray();
     void initDeletionVersionArray();
+    // Deletion version of a row: INVALID_TRANSACTION when the row carries none.
+    transaction_t getDeletedVersion(row_idx_t rowIdx) const;
+    // Not for a vector deleted whole (sameDeletionVersion).
+    void setDeletedVersion(row_idx_t rowIdx, transaction_t version);
+    bool hasDeletedRows() const;
     void setInsertedVersion(row_idx_t rowIdx, transaction_t version);
     void fillInsertedVersions(transaction_t version);
 
@@ -125,18 +137,15 @@ bool VectorVersionInfo::delete_(const transaction_t transactionID, const row_idx
         throw RuntimeException(
             "Write-write conflict: deleting a row that is already deleted by another transaction.");
     }
-    if (!deletedVersions) {
-        // No deletions before.
-        initDeletionVersionArray();
-    }
-    if (deletedVersions->operator[](rowIdx) == transactionID) {
+    const auto deletion = getDeletedVersion(rowIdx);
+    if (deletion == transactionID) {
         return false;
     }
-    if (deletedVersions->operator[](rowIdx) != INVALID_TRANSACTION) {
+    if (deletion != INVALID_TRANSACTION) {
         throw RuntimeException(
             "Write-write conflict: deleting a row that is already deleted by another transaction.");
     }
-    deletedVersions->operator[](rowIdx) = transactionID;
+    setDeletedVersion(rowIdx, transactionID);
     return true;
 }
 
@@ -158,7 +167,13 @@ void VectorVersionInfo::setDeleteCommitTS(transaction_t commitTS, row_idx_t star
         sameDeletionVersion = commitTS;
         return;
     }
-    DASSERT(deletedVersions);
+    if (!deletedVersions) {
+        // The rows of the bitmap are all of one version, the committing transaction's: a second
+        // version would have built the array.
+        DASSERT(deletedRows);
+        deletedRowsVersion = commitTS;
+        return;
+    }
     for (auto rowIdx = startRow; rowIdx < startRow + numRows; rowIdx++) {
         deletedVersions->operator[](rowIdx) = commitTS;
     }
@@ -175,13 +190,7 @@ transaction_t VectorVersionInfo::getInsertCommitTS(row_idx_t rowIdxInVector) con
 }
 
 transaction_t VectorVersionInfo::getDeleteCommitTS(row_idx_t rowIdxInVector) const {
-    if (isSameDeletionVersion()) {
-        return sameDeletionVersion;
-    }
-    if (!deletedVersions) {
-        return INVALID_TRANSACTION;
-    }
-    return deletedVersions->operator[](rowIdxInVector);
+    return getDeletedVersion(rowIdxInVector);
 }
 
 void VectorVersionInfo::stampInsertCommitTS(row_idx_t rowIdxInVector, transaction_t commitTS) {
@@ -213,11 +222,8 @@ void VectorVersionInfo::stampDeleteCommitTS(row_idx_t rowIdxInVector, transactio
         deletedVersions->fill(sameDeletionVersion);
         sameDeletionVersion = INVALID_TRANSACTION;
     }
-    if (!deletedVersions) {
-        // Fresh checkpoint-built vector: unstamped rows carry no delete.
-        initDeletionVersionArray();
-    }
-    deletedVersions->operator[](rowIdxInVector) = commitTS;
+    // On a fresh checkpoint-built vector, unstamped rows carry no delete.
+    setDeletedVersion(rowIdxInVector, commitTS);
 }
 
 bool VectorVersionInfo::hasRetainedEntries(transaction_t horizon) const {
@@ -240,6 +246,8 @@ bool VectorVersionInfo::hasRetainedEntries(transaction_t horizon) const {
                 return true;
             }
         }
+    } else if (deletedRows && deletedRowsVersion >= horizon && hasDeletedRows()) {
+        return true;
     }
     return false;
 }
@@ -296,13 +304,7 @@ bool VectorVersionInfo::isDeleted(const transaction_t startTS, const transaction
         return false;
     }
     case DeletionStatus::CHECK_VERSION: {
-        transaction_t deletion = INVALID_TRANSACTION;
-        if (isSameDeletionVersion()) {
-            deletion = sameDeletionVersion;
-        } else {
-            DASSERT(deletedVersions);
-            deletion = deletedVersions->operator[](rowIdx);
-        }
+        const auto deletion = getDeletedVersion(rowIdx);
         const auto isDeletedWithinSameTransaction = deletion == transactionID;
         const auto isDeletedByPrevCommittedTransaction = deletion <= startTS;
         return isDeletedWithinSameTransaction || isDeletedByPrevCommittedTransaction;
@@ -438,9 +440,16 @@ void VectorVersionInfo::rollbackDeletions(row_idx_t startRowInVector, row_idx_t 
             if (!hasAnyDeletions) {
                 deletedVersions.reset();
             }
+        } else if (deletedRows) {
+            for (auto row = startRowInVector; row < startRowInVector + numRows; row++) {
+                setDeletedVersion(row, INVALID_TRANSACTION);
+            }
+            if (!hasDeletedRows()) {
+                deletedRows.reset();
+            }
         }
     }
-    if (!deletedVersions) {
+    if (!deletedVersions && !deletedRows) {
         deletionStatus = DeletionStatus::NO_DELETED;
     }
 }
@@ -479,9 +488,69 @@ void VectorVersionInfo::fillInsertedVersions(transaction_t version) {
         std::memory_order_release);
 }
 
+// Moves the rows of the bitmap, if any, into the array. The array is published before the bitmap
+// goes, as readers look at the array first.
 void VectorVersionInfo::initDeletionVersionArray() {
-    deletedVersions = std::make_unique<std::array<transaction_t, DEFAULT_VECTOR_CAPACITY>>();
-    deletedVersions->fill(INVALID_TRANSACTION);
+    auto versions = std::make_unique<std::array<transaction_t, DEFAULT_VECTOR_CAPACITY>>();
+    versions->fill(INVALID_TRANSACTION);
+    if (deletedRows) {
+        for (auto row = 0u; row < DEFAULT_VECTOR_CAPACITY; row++) {
+            if ((*deletedRows)[row / 64] >> (row % 64) & 1) {
+                (*versions)[row] = deletedRowsVersion;
+            }
+        }
+    }
+    deletedVersions = std::move(versions);
+    deletedRows.reset();
+    deletedRowsVersion = INVALID_TRANSACTION;
+}
+
+transaction_t VectorVersionInfo::getDeletedVersion(row_idx_t rowIdx) const {
+    if (isSameDeletionVersion()) {
+        return sameDeletionVersion;
+    }
+    if (deletedVersions) {
+        return deletedVersions->operator[](rowIdx);
+    }
+    if (deletedRows && ((*deletedRows)[rowIdx / 64] >> (rowIdx % 64) & 1)) {
+        return deletedRowsVersion;
+    }
+    return INVALID_TRANSACTION;
+}
+
+void VectorVersionInfo::setDeletedVersion(row_idx_t rowIdx, transaction_t version) {
+    DASSERT(!isSameDeletionVersion());
+    if (!deletedVersions) {
+        const auto bit = uint64_t{1} << (rowIdx % 64);
+        if (version == INVALID_TRANSACTION) {
+            if (deletedRows) {
+                (*deletedRows)[rowIdx / 64] &= ~bit;
+            }
+            return;
+        }
+        if (!deletedRows) {
+            deletedRows = std::make_unique<std::array<uint64_t, DEFAULT_VECTOR_CAPACITY / 64>>();
+            deletedRows->fill(0);
+            deletedRowsVersion = version;
+        }
+        if (version == deletedRowsVersion) {
+            (*deletedRows)[rowIdx / 64] |= bit;
+            return;
+        }
+        // A second version in the vector.
+        initDeletionVersionArray();
+    }
+    deletedVersions->operator[](rowIdx) = version;
+}
+
+bool VectorVersionInfo::hasDeletedRows() const {
+    DASSERT(deletedRows);
+    for (const auto word : *deletedRows) {
+        if (word != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool VectorVersionInfo::isSameInsertionVersion() const {
@@ -539,11 +608,11 @@ void VectorVersionInfo::serialize(Serializer& serializer) const {
         serializer.writeDebuggingInfo("same_deletion_version");
         serializer.serializeValue<transaction_t>(collapseCommittedDelete(sameDeletionVersion));
         if (sameDeletionVersion == INVALID_TRANSACTION) {
-            DASSERT(deletedVersions);
+            // The wire format is the dense array, whatever the form in memory.
             serializer.writeDebuggingInfo("deleted_versions");
             std::array<transaction_t, DEFAULT_VECTOR_CAPACITY> wireVersions;
             for (auto i = 0u; i < DEFAULT_VECTOR_CAPACITY; i++) {
-                wireVersions[i] = collapseCommittedDelete((*deletedVersions)[i]);
+                wireVersions[i] = collapseCommittedDelete(getDeletedVersion(i));
             }
             serializer.serializeArray<transaction_t, DEFAULT_VECTOR_CAPACITY>(wireVersions);
         }
@@ -572,9 +641,14 @@ std::unique_ptr<VectorVersionInfo> VectorVersionInfo::deSerialize(Deserializer& 
         deSer.deserializeValue<transaction_t>(vectorVersionInfo->sameDeletionVersion);
         if (vectorVersionInfo->sameDeletionVersion == INVALID_TRANSACTION) {
             deSer.validateDebuggingInfo(key, "deleted_versions");
-            vectorVersionInfo->initDeletionVersionArray();
-            deSer.deserializeArray<transaction_t, DEFAULT_VECTOR_CAPACITY>(
-                *vectorVersionInfo->deletedVersions);
+            // Stored deletes are all collapsed to 0, so this mostly ends up as a bitmap.
+            std::array<transaction_t, DEFAULT_VECTOR_CAPACITY> wireVersions;
+            deSer.deserializeArray<transaction_t, DEFAULT_VECTOR_CAPACITY>(wireVersions);
+            for (auto i = 0u; i < DEFAULT_VECTOR_CAPACITY; i++) {
+                if (wireVersions[i] != INVALID_TRANSACTION) {
+                    vectorVersionInfo->setDeletedVersion(i, wireVersions[i]);
+                }
+            }
         }
     } break;
     default: {
