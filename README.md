@@ -34,14 +34,19 @@ relationships on one machine, with a fixed amount of memory. Queries and Cypher 
 
 ## How
 
-- **Load in pieces.** Relationships are copied a slice of the graph at a time, so memory holds one slice, never the
-  whole table.
-- **Look keys up once.** All node keys are turned into internal ids in one fast pass before loading.
-- **Only rewrite what changed.** Adding data touches only the parts of the graph that receive new relationships, and
-  those are rewritten in parallel.
-- **Delete in batches.** A bulk delete scans each adjacency list once, instead of searching once per relationship.
-- **Batteries included.** Full-text search and graph algorithms are built in (no download), and it can run in the same
-  process as Kuzu.
+Ladybug stores each relationship table as CSR adjacency lists (forward and backward), chunked in *node groups* of
+131,072 nodes. Upstream builds them with one COPY that keeps every relationship of both directions in memory, and
+rewrites every node group on any later COPY. The fork changes that:
+
+| Change | Upstream | Fork | Why it wins |
+|---|---|---|---|
+| **Bucketed COPY** | one COPY, both directions, whole table in memory | one COPY per range of node groups, one direction at a time (`DIRECTION`, `RAW_OFFSETS` COPY options) | memory is bounded by a bucket, not the table; each node group is written once |
+| **Key resolution** | primary-key hash-index lookup per relationship, inside the COPY | one streaming DuckDB join on **64-bit key hashes**, relationship ids taken from Parquet row positions | 4x smaller join tables than string keys, no materialized numbering: no spills |
+| **Pipelining** | — | backward buckets are split while the engine copies the forward ones | the two stages share the CPU instead of waiting on each other |
+| **Incremental COPY** | every node group rewritten | node groups with no new relationship skipped; new ones merged in contiguous runs; node groups checkpointed in parallel | adding data costs what it touches |
+| **Bulk DELETE** | one adjacency-list scan per deleted relationship (quadratic on busy nodes) | deletions batched per table, one scan per list for all its rows | linear instead of quadratic; ~3x faster in the benchmark |
+| **Concurrency fix** | shadow-page map read without its lock | read under the lock | parallel checkpoints no longer lose updates |
+| **Packaging** | FTS/algo downloaded at runtime; clashes with `kuzu` in one process | linked in; module-local bindings and `-Bsymbolic` | works offline, side by side with Kuzu |
 
 ## Use it
 
