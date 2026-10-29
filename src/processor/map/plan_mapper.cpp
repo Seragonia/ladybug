@@ -4,6 +4,7 @@
 #include "main/client_context.h"
 #include "main/database.h"
 #include "planner/operator/logical_plan.h"
+#include "processor/operator/persistent/delete.h"
 #include "processor/operator/profile.h"
 #include "processor/physical_plan_util.h"
 #include "storage/partition_storage_registry.h"
@@ -28,6 +29,10 @@ std::unique_ptr<PhysicalPlan> PlanMapper::getPhysicalPlan(const LogicalPlan* log
     const expression_vector& expressions, main::QueryResultType resultType,
     ArrowResultConfig arrowConfig) {
     auto root = mapOperator(logicalPlan->getLastOperator().get());
+    if (auto* deleteRel = dynamic_cast<DeleteRel*>(root.get())) {
+        // Nothing after it reads the graph or stops pulling tuples early (as LIMIT would).
+        deleteRel->setBatchDeletes();
+    }
     if (!root->isSink()) {
         if (resultType == main::QueryResultType::ARROW) {
             // Walk the physical plan to decide the order-preservation

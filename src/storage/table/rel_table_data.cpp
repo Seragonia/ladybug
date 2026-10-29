@@ -1,5 +1,8 @@
 #include "storage/table/rel_table_data.h"
 
+#include <algorithm>
+#include <tuple>
+
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "common/enums/rel_direction.h"
 #include "common/types/types.h"
@@ -144,18 +147,25 @@ bool RelTableData::delete_(Transaction* transaction, ValueVector& boundNodeIDVec
         return false;
     }
     const auto [source, rowIdx] = findMatchingRow(transaction, boundNodeIDVector, relIDVector);
-    if (rowIdx == INVALID_ROW_IDX || source == CSRNodeGroupScanSource::NONE) {
+    return deleteRow(transaction,
+        RelRowLookup{boundNodeIDVector.getValue<nodeID_t>(boundNodePos).offset,
+            relIDVector.getValue<nodeID_t>(relIDPos).offset, source, rowIdx});
+}
+
+// NOLINTNEXTLINE(readability-make-member-function-const): Semantically non-const.
+bool RelTableData::deleteRow(Transaction* transaction, const RelRowLookup& lookup) {
+    if (lookup.rowIdx == INVALID_ROW_IDX || lookup.source == CSRNodeGroupScanSource::NONE) {
         return false;
     }
-    const auto boundNodeOffset = boundNodeIDVector.getValue<nodeID_t>(boundNodePos).offset;
-    const auto nodeGroupIdx = StorageUtils::getNodeGroupIdx(boundNodeOffset);
+    const auto nodeGroupIdx = StorageUtils::getNodeGroupIdx(lookup.boundNodeOffset);
     if (nodeGroupIdx >= getNumNodeGroups()) {
         return false;
     }
     auto& csrNodeGroup = getNodeGroup(nodeGroupIdx)->cast<CSRNodeGroup>();
-    bool isDeleted = csrNodeGroup.delete_(transaction, source, rowIdx);
+    bool isDeleted = csrNodeGroup.delete_(transaction, lookup.source, lookup.rowIdx);
     if (isDeleted && transaction->shouldAppendToUndoBuffer()) {
-        transaction->pushDeleteInfo(nodeGroupIdx, rowIdx, 1, getVersionRecordHandler(source));
+        transaction->pushDeleteInfo(nodeGroupIdx, lookup.rowIdx, 1,
+            getVersionRecordHandler(lookup.source));
     }
     return isDeleted;
 }
@@ -246,6 +256,70 @@ std::pair<CSRNodeGroupScanSource, row_idx_t> RelTableData::findMatchingRow(Trans
         }
     }
     return {source, matchingRowIdx};
+}
+
+void RelTableData::findMatchingRows(Transaction* transaction, table_id_t boundTableID,
+    std::vector<RelRowLookup>& lookups) const {
+    std::sort(lookups.begin(), lookups.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.boundNodeOffset, a.relOffset) < std::tie(b.boundNodeOffset, b.relOffset);
+    });
+    // One scan state for the whole batch: moving to the next bound node of the same node group
+    // only reads that node's CSR header entry again.
+    ValueVector boundNodeIDVector(LogicalType::INTERNAL_ID());
+    const auto boundNodeState = std::make_shared<DataChunkState>();
+    boundNodeState->getSelVectorUnsafe().setSelSize(1);
+    boundNodeIDVector.setState(boundNodeState);
+    DataChunk scanChunk(1);
+    scanChunk.insert(0, std::make_shared<ValueVector>(LogicalType::INTERNAL_ID()));
+    std::vector columnIDs = {REL_ID_COLUMN_ID, ROW_IDX_COLUMN_ID};
+    auto scanState = std::make_unique<RelTableScanState>(*mm, &boundNodeIDVector,
+        std::vector{&scanChunk.getValueVectorMutable(0)}, scanChunk.state, true /*randomLookup*/);
+    scanState->setToTable(transaction, &table, columnIDs, {}, direction);
+    const auto scannedIDVector = scanState->outputVectors[0];
+    const auto numNodeGroups = getNumNodeGroups();
+    auto begin = lookups.begin();
+    while (begin != lookups.end()) {
+        const auto boundNodeOffset = begin->boundNodeOffset;
+        auto end = begin;
+        uint64_t numRelsToFind = 0;
+        for (; end != lookups.end() && end->boundNodeOffset == boundNodeOffset; ++end) {
+            numRelsToFind += end == begin || (end - 1)->relOffset != end->relOffset;
+        }
+        const auto nodeGroupIdx = StorageUtils::getNodeGroupIdx(boundNodeOffset);
+        if (nodeGroupIdx >= numNodeGroups) {
+            begin = end;
+            continue;
+        }
+        boundNodeIDVector.setValue<nodeID_t>(0, nodeID_t{boundNodeOffset, boundTableID});
+        scanState->initState(transaction, getNodeGroup(nodeGroupIdx));
+        // Scan the list until every rel looked up in it is found; most lists end sooner.
+        while (numRelsToFind > 0 &&
+               scanState->nodeGroup->scan(transaction, *scanState) != NODE_GROUP_SCAN_EMPTY_RESULT) {
+            const auto scanSource =
+                scanState->nodeGroupScanState->cast<CSRNodeGroupScanState>().source;
+            for (auto i = 0u; i < scanState->outState->getSelVector().getSelSize(); i++) {
+                const auto pos = scanState->outState->getSelVector()[i];
+                const auto relOffset = scannedIDVector->getValue<internalID_t>(pos).offset;
+                auto it = std::lower_bound(begin, end, relOffset,
+                    [](const RelRowLookup& lookup, offset_t offset) {
+                        return lookup.relOffset < offset;
+                    });
+                if (it == end || it->relOffset != relOffset ||
+                    it->source != CSRNodeGroupScanSource::NONE) {
+                    continue;
+                }
+                const auto rowIdxPos = scanState->rowIdxVector->state->getSelVector()[i];
+                const auto rowIdx = scanState->rowIdxVector->getValue<row_idx_t>(rowIdxPos);
+                // The same rel can be looked up more than once (e.g. listed twice in a DELETE).
+                for (; it != end && it->relOffset == relOffset; ++it) {
+                    it->source = scanSource;
+                    it->rowIdx = rowIdx;
+                }
+                numRelsToFind--;
+            }
+        }
+        begin = end;
+    }
 }
 
 bool RelTableData::checkIfNodeHasRels(Transaction* transaction,

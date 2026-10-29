@@ -450,6 +450,70 @@ bool RelTable::delete_(Transaction* transaction, TableDeleteState& deleteState) 
     return isDeleted;
 }
 
+void RelTable::deleteBatch(Transaction* transaction, const std::vector<RelToDelete>& rels,
+    bool logToWAL) {
+    if (rels.empty()) {
+        return;
+    }
+    const auto boundOffset = [](const RelToDelete& rel, RelDataDirection direction) {
+        return direction == RelDataDirection::FWD ? rel.srcNodeID.offset : rel.dstNodeID.offset;
+    };
+    std::vector<std::vector<RelRowLookup>> lookups(directedRelData.size());
+    for (auto i = 0u; i < directedRelData.size(); i++) {
+        const auto direction = directedRelData[i]->getDirection();
+        lookups[i].reserve(rels.size());
+        for (const auto& rel : rels) {
+            lookups[i].push_back(RelRowLookup{boundOffset(rel, direction), rel.relID.offset});
+        }
+        directedRelData[i]->findMatchingRows(transaction,
+            direction == RelDataDirection::FWD ? fromNodeTableID : toNodeTableID, lookups[i]);
+    }
+    std::unique_ptr<ValueVector> srcNodeIDVector, dstNodeIDVector, relIDVector;
+    logToWAL = logToWAL && transaction->shouldLogToWAL();
+    if (logToWAL) {
+        const auto state = DataChunkState::getSingleValueDataChunkState();
+        srcNodeIDVector = std::make_unique<ValueVector>(LogicalType::INTERNAL_ID());
+        dstNodeIDVector = std::make_unique<ValueVector>(LogicalType::INTERNAL_ID());
+        relIDVector = std::make_unique<ValueVector>(LogicalType::INTERNAL_ID());
+        srcNodeIDVector->setState(state);
+        dstNodeIDVector->setState(state);
+        relIDVector->setState(state);
+    }
+    bool hasDeleted = false;
+    for (const auto& rel : rels) {
+        bool isDeleted = false;
+        for (auto i = 0u; i < directedRelData.size(); i++) {
+            const auto key = std::make_pair(boundOffset(rel, directedRelData[i]->getDirection()),
+                rel.relID.offset);
+            const auto it = std::lower_bound(lookups[i].begin(), lookups[i].end(), key,
+                [](const RelRowLookup& lookup, const std::pair<offset_t, offset_t>& k) {
+                    return std::make_pair(lookup.boundNodeOffset, lookup.relOffset) < k;
+                });
+            DASSERT(it != lookups[i].end() && it->boundNodeOffset == key.first &&
+                    it->relOffset == key.second);
+            isDeleted = directedRelData[i]->deleteRow(transaction, *it);
+            if (!isDeleted) {
+                break;
+            }
+        }
+        if (!isDeleted) {
+            continue;
+        }
+        hasDeleted = true;
+        if (logToWAL) {
+            DASSERT(transaction->isWriteTransaction());
+            srcNodeIDVector->setValue<nodeID_t>(0, rel.srcNodeID);
+            dstNodeIDVector->setValue<nodeID_t>(0, rel.dstNodeID);
+            relIDVector->setValue<relID_t>(0, rel.relID);
+            transaction->getLocalWAL().logRelDelete(getOwnerCatalogName(), tableID,
+                srcNodeIDVector.get(), dstNodeIDVector.get(), relIDVector.get());
+        }
+    }
+    if (hasDeleted) {
+        setHasChanges();
+    }
+}
+
 void RelTable::detachDelete(Transaction* transaction, RelTableDeleteState* deleteState) {
     auto direction = deleteState->detachDeleteDirection;
     if (std::ranges::count(getStorageDirections(), direction) == 0) {
@@ -504,13 +568,11 @@ void RelTable::detachDeleteBatch(Transaction* transaction, ValueVector& srcNodeI
         return;
     }
 
-    const auto tableData = getDirectedTableData(direction);
-    const auto reverseTableData =
-        directedRelData.size() == NUM_REL_DIRECTIONS ?
-            getDirectedTableData(RelDirectionUtils::getOppositeDirection(direction)) :
-            nullptr;
     const auto localTable = transaction->getLocalStorage()->getLocalTable(*this);
-
+    // The rels of committed data are deleted in batches, which find their rows in both
+    // directions with one scan per list (a node with many rels is otherwise scanned once per
+    // rel). The detach delete record below covers them in the WAL.
+    std::vector<RelToDelete> relsToDelete;
     for (const auto srcNodeID : srcNodeIDs) {
         const auto srcState = std::make_shared<DataChunkState>();
         ValueVector tempSrcNodeID(LogicalType::INTERNAL_ID());
@@ -545,17 +607,20 @@ void RelTable::detachDeleteBatch(Transaction* transaction, ValueVector& srcNodeI
                     localTable->delete_(transaction, localDeleteState);
                     continue;
                 }
-                [[maybe_unused]] const auto deleted =
-                    tableData->delete_(transaction, tempSrcNodeID, relIDVector);
-                if (reverseTableData) {
-                    [[maybe_unused]] const auto reverseDeleted =
-                        reverseTableData->delete_(transaction, dstNodeIDVector, relIDVector);
-                    DASSERT(deleted == reverseDeleted);
+                const auto nbrNodeID = dstNodeIDVector.getValue<nodeID_t>(relIDPos);
+                const auto relID = relIDVector.getValue<relID_t>(relIDPos);
+                relsToDelete.push_back(direction == RelDataDirection::FWD ?
+                                           RelToDelete{srcNodeID, nbrNodeID, relID} :
+                                           RelToDelete{nbrNodeID, srcNodeID, relID});
+                if (relsToDelete.size() >= DELETE_BATCH_SIZE) {
+                    deleteBatch(transaction, relsToDelete, false /*logToWAL*/);
+                    relsToDelete.clear();
                 }
             }
             relState->getSelVectorUnsafe().setToUnfiltered();
         }
     }
+    deleteBatch(transaction, relsToDelete, false /*logToWAL*/);
     if (transaction->shouldLogToWAL()) {
         DASSERT(transaction->isWriteTransaction());
         transaction->getLocalWAL().logRelDetachDelete(getOwnerCatalogName(), tableID, direction,

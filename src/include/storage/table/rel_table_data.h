@@ -29,6 +29,14 @@ struct CSRHeaderColumns {
     std::unique_ptr<Column> length;
 };
 
+// A rel whose row in its bound node's CSR list RelTableData::findMatchingRows looks up.
+struct RelRowLookup {
+    common::offset_t boundNodeOffset;
+    common::offset_t relOffset;
+    CSRNodeGroupScanSource source = CSRNodeGroupScanSource::NONE;
+    common::row_idx_t rowIdx = common::INVALID_ROW_IDX;
+};
+
 class PersistentVersionRecordHandler final : public VersionRecordHandler {
 public:
     PersistentVersionRecordHandler(RelTableData* relTableData, catalog::Catalog* ownerCatalog);
@@ -69,6 +77,13 @@ public:
         const common::ValueVector& dataVector) const;
     bool delete_(transaction::Transaction* transaction, common::ValueVector& boundNodeIDVector,
         const common::ValueVector& relIDVector);
+    // Finds the rows of many rels of committed data, scanning the list of each bound node once
+    // for all its rels. Sorts lookups by bound node then rel offset; a rel not found keeps
+    // source NONE.
+    void findMatchingRows(transaction::Transaction* transaction, common::table_id_t boundTableID,
+        std::vector<RelRowLookup>& lookups) const;
+    // Deletes the row findMatchingRows found for a rel, as delete_ does.
+    bool deleteRow(transaction::Transaction* transaction, const RelRowLookup& lookup);
     void addColumn(TableAddColumnState& addColumnState, PageAllocator& pageAllocator);
 
     bool checkIfNodeHasRels(transaction::Transaction* transaction,

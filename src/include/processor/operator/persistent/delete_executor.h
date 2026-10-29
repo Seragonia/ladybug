@@ -1,7 +1,9 @@
 #pragma once
 
 #include <memory>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "common/enums/delete_type.h"
 #include "common/vector/value_vector.h"
@@ -172,17 +174,30 @@ private:
 class RelDeleteExecutor {
 public:
     explicit RelDeleteExecutor(RelDeleteInfo info) : info{std::move(info)} {}
-    RelDeleteExecutor(const RelDeleteExecutor& other) : info{other.info.copy()} {}
+    RelDeleteExecutor(const RelDeleteExecutor& other)
+        : info{other.info.copy()}, batchDeletes{other.batchDeletes} {}
     virtual ~RelDeleteExecutor() = default;
 
     virtual void init(ResultSet* resultSet, ExecutionContext* context);
 
     virtual void delete_(ExecutionContext* context) = 0;
 
+    // Deletes the rels still batched.
+    void finalize(ExecutionContext* context);
+
+    // Only when nothing reads the graph after this delete in the query (it ends the plan): the
+    // rels are then deleted in batches, which find their rows with one scan per CSR list.
+    void setBatchDeletes() { batchDeletes = true; }
+
     virtual std::unique_ptr<RelDeleteExecutor> copy() const = 0;
 
 protected:
+    // Deletes the rel of the current tuple, now or with the next batch of the table.
+    void deleteRel(storage::RelTable* table, ExecutionContext* context);
+
     RelDeleteInfo info;
+    bool batchDeletes = false;
+    std::unordered_map<storage::RelTable*, std::vector<storage::RelToDelete>> batches;
 };
 
 class EmptyRelDeleteExecutor final : public RelDeleteExecutor {

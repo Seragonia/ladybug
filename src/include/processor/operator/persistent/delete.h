@@ -80,6 +80,13 @@ public:
 
     bool isParallel() const override { return false; }
 
+    // See RelDeleteExecutor::setBatchDeletes.
+    void setBatchDeletes() {
+        for (auto& executor : executors) {
+            executor->setBatchDeletes();
+        }
+    }
+
     void initLocalStateInternal(ResultSet* resultSet, ExecutionContext* context) override;
 
     bool getNextTuplesInternal(ExecutionContext* context) override;

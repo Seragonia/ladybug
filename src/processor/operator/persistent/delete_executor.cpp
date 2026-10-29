@@ -209,10 +209,41 @@ void RelDeleteExecutor::init(ResultSet* resultSet, ExecutionContext*) {
     info.init(*resultSet);
 }
 
-void SingleLabelRelDeleteExecutor::delete_(ExecutionContext* context) {
+void RelDeleteExecutor::deleteRel(RelTable* table, ExecutionContext* context) {
+    const auto transaction = Transaction::Get(*context->clientContext);
+    const auto srcPos = info.srcNodeIDVector->state->getSelVector()[0];
+    const auto dstPos = info.dstNodeIDVector->state->getSelVector()[0];
+    const auto relPos = info.relIDVector->state->getSelVector()[0];
+    if (batchDeletes && !info.srcNodeIDVector->isNull(srcPos) &&
+        !info.dstNodeIDVector->isNull(dstPos) && !info.relIDVector->isNull(relPos)) {
+        const auto relID = info.relIDVector->getValue<relID_t>(relPos);
+        // A rel inserted by this transaction is in local storage: delete it now, below.
+        if (relID.offset < StorageConstants::MAX_NUM_ROWS_IN_TABLE) {
+            auto& batch = batches[table];
+            batch.push_back(RelToDelete{info.srcNodeIDVector->getValue<nodeID_t>(srcPos),
+                info.dstNodeIDVector->getValue<nodeID_t>(dstPos), relID});
+            if (batch.size() >= RelTable::DELETE_BATCH_SIZE) {
+                table->deleteBatch(transaction, batch, true /*logToWAL*/);
+                batch.clear();
+            }
+            return;
+        }
+    }
     auto deleteState = std::make_unique<RelTableDeleteState>(*info.srcNodeIDVector,
         *info.dstNodeIDVector, *info.relIDVector);
-    table->delete_(Transaction::Get(*context->clientContext), *deleteState);
+    table->delete_(transaction, *deleteState);
+}
+
+void RelDeleteExecutor::finalize(ExecutionContext* context) {
+    const auto transaction = Transaction::Get(*context->clientContext);
+    for (auto& [table, batch] : batches) {
+        table->deleteBatch(transaction, batch, true /*logToWAL*/);
+        batch.clear();
+    }
+}
+
+void SingleLabelRelDeleteExecutor::delete_(ExecutionContext* context) {
+    deleteRel(table, context);
 }
 
 void MultiLabelRelDeleteExecutor::delete_(ExecutionContext* context) {
@@ -221,10 +252,7 @@ void MultiLabelRelDeleteExecutor::delete_(ExecutionContext* context) {
     const auto pos = idSelVector[0];
     const auto relID = info.relIDVector->getValue<internalID_t>(pos);
     DASSERT(tableIDToTableMap.contains(relID.tableID));
-    auto table = tableIDToTableMap.at(relID.tableID);
-    auto deleteState = std::make_unique<RelTableDeleteState>(*info.srcNodeIDVector,
-        *info.dstNodeIDVector, *info.relIDVector);
-    table->delete_(Transaction::Get(*context->clientContext), *deleteState);
+    deleteRel(tableIDToTableMap.at(relID.tableID), context);
 }
 
 } // namespace processor

@@ -180,6 +180,13 @@ struct LBUG_API RelTableDeleteState final : TableDeleteState {
           relIDVector{relIDVector}, detachDeleteDirection{detachDeleteDirection} {}
 };
 
+// A rel of committed data for RelTable::deleteBatch.
+struct RelToDelete {
+    common::nodeID_t srcNodeID;
+    common::nodeID_t dstNodeID;
+    common::relID_t relID;
+};
+
 struct RelDegreeSummary {
     common::row_idx_t numActiveBoundNodes = 0;
     common::row_idx_t totalDegree = 0;
@@ -209,6 +216,14 @@ public:
     void insert(transaction::Transaction* transaction, TableInsertState& insertState) override;
     void update(transaction::Transaction* transaction, TableUpdateState& updateState) override;
     bool delete_(transaction::Transaction* transaction, TableDeleteState& deleteState) override;
+    // Rels deleteBatch is given at most at once by its callers: the batch and its row lookups
+    // take about 100 bytes a rel.
+    static constexpr uint64_t DELETE_BATCH_SIZE = 1 << 19;
+    // Deletes rels of committed data as delete_ does each, but finds their rows with one scan of
+    // each bound node's list for the whole batch, not one per rel. Logs each deleted rel to the
+    // WAL if logToWAL.
+    void deleteBatch(transaction::Transaction* transaction, const std::vector<RelToDelete>& rels,
+        bool logToWAL);
 
     // Deletes all edges attached to the node(s) specified in the deleteState
     // Currently only supports deleting from a single src node
