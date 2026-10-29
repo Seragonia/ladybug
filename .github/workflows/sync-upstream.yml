@@ -1,0 +1,87 @@
+# Merges upstream Ladybug into this fork's branch every week, once the fork's own tests pass on the result.
+# A conflict or a failing test opens an issue instead, and nothing is pushed.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"  # Mondays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+
+env:
+  BRANCH: bucketed-rel-copy
+  UPSTREAM: https://github.com/LadybugDB/ladybug
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    if: github.repository == 'Seragonia/ladybug'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream "$UPSTREAM_BRANCH"
+          if git merge-base --is-ancestor upstream/"$UPSTREAM_BRANCH" HEAD; then
+            echo "Already up to date."; echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "upstream=$(git rev-parse --short upstream/$UPSTREAM_BRANCH)" >> "$GITHUB_OUTPUT"
+          if ! git merge --no-edit upstream/"$UPSTREAM_BRANCH"; then
+            git diff --name-only --diff-filter=U > conflicts.txt
+            echo "conflict=true" >> "$GITHUB_OUTPUT"; exit 1
+          fi
+          git submodule update --init --recursive
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build libssl-dev
+          python3 -m venv /tmp/venv && /tmp/venv/bin/pip install -q duckdb pyarrow pandas numpy pybind11
+          make python-bundled NUM_THREADS=$(nproc) GEN=Ninja \
+            EXTRA_CMAKE_FLAGS="-DPython3_EXECUTABLE=/tmp/venv/bin/python"
+
+      - name: Test
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          export PYTHONPATH=$PWD/tools/python_api/build
+          cd scripts/bucketed_load
+          /tmp/venv/bin/python test_bucketed_load.py /tmp/t-duckdb duckdb
+          /tmp/venv/bin/python test_bucketed_load.py /tmp/t-engine engine
+          /tmp/venv/bin/python test_extend.py /tmp/t-extend
+          /tmp/venv/bin/python test_bulk_delete.py /tmp/t-delete
+          /tmp/venv/bin/pip install -q kuzu && /tmp/venv/bin/python test_bundled_extensions.py
+
+      - name: Push
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:"$BRANCH"
+
+      - name: Open an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Merging upstream \`$UPSTREAM_BRANCH\` (${{ steps.merge.outputs.upstream }}) into \`$BRANCH\` failed; nothing was pushed."
+            echo
+            if [ -s conflicts.txt ]; then echo "Conflicting files:"; sed 's/^/- /' conflicts.txt; else echo "The build or the tests failed."; fi
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > body.md
+          gh issue create --title "Upstream sync failed ($(date -u +%F))" --body-file body.md
