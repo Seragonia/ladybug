@@ -4,7 +4,7 @@ DuckDB resolves keys to node offsets and assigns rel offsets once, then splits t
 node-group-aligned buckets: by src for the FWD CSR, by dst for the BWD CSR. Each bucket is one COPY
 that writes only the node groups it covers, so RAM is bounded by the bucket, not the table, and an
 extend writes only the node groups it touches. engine_bucketed_copy does the same without DuckDB."""
-import os, shutil, time
+import os, shutil, threading, time
 
 NODE_GROUP_SIZE = 1 << 17
 
@@ -85,7 +85,12 @@ def engine_bucketed_copy(conn, rel, src_table, dst_table, edges, src_col, dst_co
 
 
 def bucketed_copy(conn, rel, src_table, src_key, dst_table, dst_key, edges, src_col, dst_col,
-                  props, work_dir, edges_per_bucket=25_000_000, duck_mem="6GB", log=print):
+                  props, work_dir, edges_per_bucket=25_000_000, duck_mem="6GB", where=None, log=print):
+    """edges: a quoted Parquet path or glob ('...'), filtered by `where` if given, or any DuckDB relation.
+
+    For Parquet input a rel's offset is its row position in the files, which DuckDB reads in parallel;
+    rows that `where` or a missing endpoint drops leave holes. Any other relation is numbered with a
+    window, which DuckDB has to materialize whole, so it is much slower on large inputs."""
     import duckdb
     shutil.rmtree(work_dir, ignore_errors=True)
     os.makedirs(work_dir)
@@ -99,38 +104,83 @@ def bucketed_copy(conn, rel, src_table, src_key, dst_table, dst_key, edges, src_
     base = next_rel_offset(conn, rel)
     log("maps", round(time.time() - t0, 1))
     d = duckdb.connect()
-    d.execute(f"SET memory_limit='{duck_mem}'; SET temp_directory='{work_dir}/duck_tmp'; "
-              "SET preserve_insertion_order=false")
+    # More threads than this split DuckDB's memory into buffers too small for the joins, which then spill.
+    d.execute(f"SET memory_limit='{duck_mem}'; SET threads={min(os.cpu_count() or 1, 8)}; "
+              f"SET temp_directory='{work_dir}/duck_tmp'; SET preserve_insertion_order=false")
+    # Join on 64-bit key hashes: hash tables a quarter the size of string keys', so far fewer spills. If two
+    # node keys share a hash, join on the keys. An edge key with no node can only match a node whose key has
+    # the same hash (odds ~1e-11 per such edge at 100M nodes) instead of being dropped.
+    maps = {}
+    for name, path in (("src_map", src_map), ("dst_map", dst_map)):
+        if path in maps.values():
+            maps[name] = maps[next(n for n, p in maps.items() if p == path)]
+            continue
+        unique = d.execute(f"SELECT count(DISTINCT hash(k)) = count(*) FROM '{path}'").fetchone()[0]
+        if unique:
+            d.execute(f"COPY (SELECT hash(k) AS k, off FROM '{path}') TO '{path}.h.parquet'")
+        maps[name] = f"{path}.h.parquet" if unique else path
+    key = lambda name, col: f"hash(e.{col})" if maps[name].endswith(".h.parquet") else f"e.{col}"
     n_src = d.execute(f"SELECT max(off) + 1 FROM '{src_map}'").fetchone()[0] or 0
     n_dst = d.execute(f"SELECT max(off) + 1 FROM '{dst_map}'").fetchone()[0] or 0
-    n_edges = d.execute(f"SELECT count(*) FROM {edges}").fetchone()[0]
+    flt = f" WHERE {where}" if where else ""
+    files = edges[1:-1] if edges.startswith("'") and edges.endswith("'") else None
+    n_edges = d.execute(f"SELECT count(*) FROM {edges} e{flt}").fetchone()[0]
     k = max(1, -(-n_edges // edges_per_bucket))
     ceil = lambda a, b: -(-a // b)
     # A bucket spans whole node groups: its COPY then writes each of them once.
     src_span = NODE_GROUP_SIZE * max(1, ceil(ceil(n_src, NODE_GROUP_SIZE), k))
     dst_span = NODE_GROUP_SIZE * max(1, ceil(ceil(n_dst, NODE_GROUP_SIZE), k))
-    cols = ", ".join(f"e.{p}" for p in props)
+    cols = "".join(f", e.{p}" for p in props)
     t = time.time()
-    # Resolve keys once; edges whose endpoints are missing are dropped, like COPY's lookups fail.
-    d.execute(f"""COPY (SELECT s.off AS src, t.off AS dst,
-        {base} + row_number() OVER () - 1 AS rel{', ' + cols if cols else ''}
-        FROM {edges} e JOIN '{src_map}' s ON s.k = e.{src_col} JOIN '{dst_map}' t ON t.k = e.{dst_col})
-        TO '{work_dir}/r.parquet' (FORMAT parquet)""")
+    if files:
+        # A rel's offset is its row position in the files: the first row of each file, plus its row number.
+        d.execute(f"""CREATE TEMP TABLE file_start AS SELECT file_name,
+            sum(num_rows) OVER (ORDER BY file_name) - num_rows AS start FROM parquet_file_metadata('{files}')""")
+        source = f"""read_parquet('{files}', filename=true, file_row_number=true) e
+            JOIN file_start f ON f.file_name = e.filename"""
+        rel_offset = f"{base} + f.start + e.file_row_number"
+    else:
+        source, rel_offset = f"{edges} e", f"{base} + row_number() OVER () - 1"
+    # Resolve keys once, straight into the FWD buckets; edges whose endpoints are missing are dropped, as
+    # COPY's key lookups would. The BWD buckets are then split from the FWD ones.
+    d.execute(f"""COPY (SELECT s.off AS src, t.off AS dst, {rel_offset} AS rel{cols}, s.off // {src_span} AS b
+        FROM {source} JOIN '{maps["src_map"]}' s ON s.k = {key("src_map", src_col)}
+        JOIN '{maps["dst_map"]}' t ON t.k = {key("dst_map", dst_col)}{flt})
+        TO '{work_dir}/fwd' (FORMAT parquet, PARTITION_BY (b))""")
     log("resolve", round(time.time() - t, 1))
-    t = time.time()
-    for name, col, span in (("fwd", "src", src_span), ("bwd", "dst", dst_span)):
-        d.execute(f"COPY (SELECT *, {col} // {span} AS b FROM '{work_dir}/r.parquet') TO '{work_dir}/{name}' "
-                  "(FORMAT parquet, PARTITION_BY (b))")
-    os.remove(f"{work_dir}/r.parquet")
-    d.close()
-    log("bucket", round(time.time() - t, 1), "k", k)
+    # DuckDB splits the BWD buckets while the engine copies the FWD ones: neither uses every core.
+    split_error = []
+
+    def split_bwd():
+        try:
+            t = time.time()
+            d.execute(f"""COPY (SELECT *, dst // {dst_span} AS b
+                FROM read_parquet('{work_dir}/fwd/*/*.parquet', hive_partitioning=false))
+                TO '{work_dir}/bwd' (FORMAT parquet, PARTITION_BY (b))""")
+            log("bucket", round(time.time() - t, 1), "k", k)
+        except Exception as error:  # raised after the FWD copies
+            split_error.append(error)
+        finally:
+            d.close()
+
+    splitter = threading.Thread(target=split_bwd)
+    splitter.start()
     timings = {}
-    for name in ("fwd", "bwd"):
+
+    def copy_buckets(name):
         for b in sorted(os.listdir(f"{work_dir}/{name}"), key=lambda s: int(s.split("=")[1])):
             t = time.time()
             conn.execute(f"COPY {rel} FROM '{work_dir}/{name}/{b}/*.parquet' "
                          f"(DIRECTION='{name}', RAW_OFFSETS=true)")
             timings[f"{name}_{b}"] = round(time.time() - t, 2)
             log(name, b, timings[f"{name}_{b}"])
+
+    try:
+        copy_buckets("fwd")
+    finally:
+        splitter.join()
+    if split_error:
+        raise split_error[0]
+    copy_buckets("bwd")
     shutil.rmtree(work_dir, ignore_errors=True)
     return {"edges": n_edges, "buckets": k, "copies": timings, "total_s": round(time.time() - t0, 1)}
