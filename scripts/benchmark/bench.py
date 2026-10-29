@@ -20,6 +20,8 @@ buffer_pool = int(float(sys.argv[6]) * 2**30) if len(sys.argv) > 6 else 8 * 2**3
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bucketed_load"))
 
 EDGES_PER_BUCKET = 25_000_000
+# The bucketed loader runs DuckDB in this process: its memory counts in the fork's peak RSS.
+DUCKDB_MEMORY = "3GB"
 out = {"engine": engine, "phase": phase, "data": os.path.basename(data.rstrip("/"))}
 
 
@@ -44,7 +46,7 @@ def copy_rels(conn, rel, src, dst, file, props, where=None):
         from bucketed_load import bucketed_copy
 
         bucketed_copy(conn, rel, src, "id", dst, "id", edges, "src", "dst", props, db_path + ".work",
-                      edges_per_bucket=EDGES_PER_BUCKET, log=lambda *a: None)
+                      edges_per_bucket=EDGES_PER_BUCKET, duck_mem=DUCKDB_MEMORY, log=lambda *a: None)
     elif where is None:
         conn.execute(f"COPY {rel} FROM '{data}/{file}'")
     else:
