@@ -223,7 +223,8 @@ static options_t getScanSourceOptions(const CopyFrom& copyFrom) {
     options_t options;
     static case_insensitve_set_t copyFromPairsOptions = {CopyConstants::FROM_OPTION_NAME,
         CopyConstants::TO_OPTION_NAME, CopyConstants::REL_DIRECTION_OPTION_NAME,
-        CopyConstants::RAW_OFFSETS_OPTION_NAME};
+        CopyConstants::RAW_OFFSETS_OPTION_NAME, CopyConstants::REL_OFFSETS_OPTION_NAME,
+        CopyConstants::NODE_GROUP_BEGIN_OPTION_NAME, CopyConstants::NODE_GROUP_END_OPTION_NAME};
     for (auto& option : copyFrom.getParsingOptions()) {
         if (copyFromPairsOptions.contains(option.first)) {
             continue;
@@ -325,9 +326,16 @@ std::unique_ptr<BoundStatement> Binder::bindCopyRelFrom(const Statement& stateme
     const auto& options = copyStatement.getParsingOptions();
     const auto rawOffsets =
         getBoolCopyOption(options, CopyConstants::RAW_OFFSETS_OPTION_NAME, false);
+    const auto relOffsets =
+        getBoolCopyOption(options, CopyConstants::REL_OFFSETS_OPTION_NAME, false);
+    if (rawOffsets && relOffsets) {
+        throw BinderException("COPY options RAW_OFFSETS and REL_OFFSETS cannot be combined.");
+    }
     if (rawOffsets) {
         expectedColumnTypes[0] = LogicalType::INT64();
         expectedColumnTypes[1] = LogicalType::INT64();
+    }
+    if (rawOffsets || relOffsets) {
         expectedColumnNames.insert(expectedColumnNames.begin() + 2,
             CopyConstants::RAW_REL_OFFSET_COLUMN_NAME);
         expectedColumnTypes.insert(expectedColumnTypes.begin() + 2, LogicalType::INT64());
@@ -348,13 +356,54 @@ std::unique_ptr<BoundStatement> Binder::bindCopyRelFrom(const Statement& stateme
         }
         directions = {wanted};
     }
+    const auto keepsNodeGroupRange =
+        options.contains(CopyConstants::NODE_GROUP_BEGIN_OPTION_NAME) ||
+        options.contains(CopyConstants::NODE_GROUP_END_OPTION_NAME);
+    if (keepsNodeGroupRange &&
+        (!relOffsets || !options.contains(CopyConstants::REL_DIRECTION_OPTION_NAME))) {
+        throw BinderException("COPY options NODE_GROUP_BEGIN and NODE_GROUP_END need "
+                              "DIRECTION and REL_OFFSETS=true.");
+    }
     // Bind info
     auto boundCopyFromInfo =
         bindCopyRelFromInfo(relGroupEntry.getName(), relGroupEntry.getProperties(),
             copyStatement.getSource(), getScanSourceOptions(copyStatement), expectedColumnNames,
             expectedColumnTypes, fromTable, toTable, rawOffsets);
-    static_cast<ExtraBoundCopyRelInfo&>(*boundCopyFromInfo.extraInfo).directions =
-        std::move(directions);
+    auto& extraInfo = static_cast<ExtraBoundCopyRelInfo&>(*boundCopyFromInfo.extraInfo);
+    extraInfo.inputRelOffsets = rawOffsets || relOffsets;
+    if (relOffsets) {
+        // Keys are still looked up; only the rel offset comes from the input.
+        auto relOffset = boundCopyFromInfo.getSourceColumns()[2];
+        boundCopyFromInfo.columnExprs[2] =
+            relOffset->getDataType() == LogicalType::INT64() ?
+                relOffset :
+                expressionBinder.forceCast(relOffset, LogicalType::INT64());
+    }
+    if (keepsNodeGroupRange) {
+        auto bound = bindParsingOptions(options);
+        auto nodeGroup = [&](const char* name, int64_t defaultValue) {
+            if (!bound.contains(name)) {
+                return defaultValue;
+            }
+            auto& value = bound.at(name);
+            if (value.getDataType() != LogicalType::INT64() || value.getValue<int64_t>() < 0) {
+                throw BinderException(
+                    std::format("COPY option {} must be a non-negative integer.", name));
+            }
+            return value.getValue<int64_t>();
+        };
+        const auto begin = nodeGroup(CopyConstants::NODE_GROUP_BEGIN_OPTION_NAME, 0);
+        const auto end = nodeGroup(CopyConstants::NODE_GROUP_END_OPTION_NAME,
+            static_cast<int64_t>(INVALID_OFFSET >> StorageConfig::NODE_GROUP_SIZE_LOG2));
+        // Look up the bound node first: rels outside the range then skip the other lookup.
+        auto& infos = extraInfo.infos;
+        if (directions[0] == RelDataDirection::BWD) {
+            std::swap(infos[0], infos[1]);
+        }
+        infos[0].keepBegin = static_cast<offset_t>(begin) << StorageConfig::NODE_GROUP_SIZE_LOG2;
+        infos[0].keepEnd = static_cast<offset_t>(end) << StorageConfig::NODE_GROUP_SIZE_LOG2;
+    }
+    extraInfo.directions = std::move(directions);
     return std::make_unique<BoundCopyFrom>(std::move(boundCopyFromInfo));
 }
 

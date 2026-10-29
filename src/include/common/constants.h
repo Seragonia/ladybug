@@ -121,6 +121,14 @@ struct CopyConstants {
     static constexpr const char* REL_DIRECTION_OPTION_NAME = "DIRECTION";
     static constexpr const char* RAW_OFFSETS_OPTION_NAME = "RAW_OFFSETS";
     static constexpr const char* RAW_REL_OFFSET_COLUMN_NAME = "_rel_offset";
+    // REL_OFFSETS=true keeps the primary-key lookups but reads the rel offset from the third input
+    // column, so the two directions of a rel get the same id without resolving keys beforehand.
+    // NODE_GROUP_BEGIN/NODE_GROUP_END (with DIRECTION and REL_OFFSETS) keep only the rels whose
+    // bound node is in node groups [begin, end): the others are dropped right after their bound
+    // key is looked up, so a bucket costs the memory of its rels while re-scanning the input.
+    static constexpr const char* REL_OFFSETS_OPTION_NAME = "REL_OFFSETS";
+    static constexpr const char* NODE_GROUP_BEGIN_OPTION_NAME = "NODE_GROUP_BEGIN";
+    static constexpr const char* NODE_GROUP_END_OPTION_NAME = "NODE_GROUP_END";
 
     static constexpr const char* BOOL_CSV_PARSING_OPTIONS[] = {"HEADER", "PARALLEL",
         "MULTILINE_PARALLEL", "LIST_UNBRACED", "AUTODETECT", "AUTO_DETECT",

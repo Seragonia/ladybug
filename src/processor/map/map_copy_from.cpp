@@ -87,7 +87,7 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapPartitioner(
     PartitionerInfo partitionerInfo;
     partitionerInfo.relOffsetDataPos =
         getDataPos(*logicalPartitioner.getInfo().offset, *outFSchema);
-    partitionerInfo.rawOffsets = extraInfo.rawOffsets;
+    partitionerInfo.rawOffsets = extraInfo.inputRelOffsets;
     partitionerInfo.infos.reserve(logicalPartitioner.getInfo().getNumInfos());
     for (auto i = 0u; i < logicalPartitioner.getInfo().getNumInfos(); i++) {
         partitionerInfo.infos.emplace_back(logicalPartitioner.getInfo().getInfo(i).keyIdx,

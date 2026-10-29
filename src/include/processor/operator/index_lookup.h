@@ -34,6 +34,11 @@ struct IndexLookupInfo {
     std::unique_ptr<evaluator::ExpressionEvaluator> keyEvaluator;
     DataPos resultVectorPos;
     std::shared_ptr<NoIndexLookupCache> noIndexLookupCache;
+    // Rows whose looked-up offset is outside [keepBegin, keepEnd) are dropped.
+    common::offset_t keepBegin = 0;
+    common::offset_t keepEnd = common::INVALID_OFFSET;
+
+    bool keepsRange() const { return keepBegin != 0 || keepEnd != common::INVALID_OFFSET; }
 
     IndexLookupInfo(storage::NodeTable* nodeTable,
         std::unique_ptr<evaluator::ExpressionEvaluator> keyEvaluator,
@@ -45,7 +50,8 @@ struct IndexLookupInfo {
 private:
     IndexLookupInfo(const IndexLookupInfo& other)
         : nodeTable{other.nodeTable}, keyEvaluator{other.keyEvaluator->copy()},
-          resultVectorPos{other.resultVectorPos}, noIndexLookupCache{other.noIndexLookupCache} {}
+          resultVectorPos{other.resultVectorPos}, noIndexLookupCache{other.noIndexLookupCache},
+          keepBegin{other.keepBegin}, keepEnd{other.keepEnd} {}
 };
 
 struct IndexLookupPrintInfo final : OPPrintInfo {

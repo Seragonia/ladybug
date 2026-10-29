@@ -10,6 +10,9 @@ struct IndexLookupInfo {
     std::shared_ptr<Expression> offset; // output
     std::shared_ptr<Expression> key;    // input
     expression_vector warningExprs;
+    // Rows whose looked-up offset is outside [keepBegin, keepEnd) are dropped.
+    common::offset_t keepBegin = 0;
+    common::offset_t keepEnd = common::INVALID_OFFSET;
 
     IndexLookupInfo(common::table_id_t nodeTableID, std::shared_ptr<Expression> offset,
         std::shared_ptr<Expression> key, expression_vector warningExprs = {})

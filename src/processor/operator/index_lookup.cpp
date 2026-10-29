@@ -267,16 +267,45 @@ IndexLookup::IndexLookup(std::vector<IndexLookupInfo> infos,
     }
 }
 
+// Drops the selected rows whose offset is outside [begin, end).
+static void keepOffsetsInRange(ValueVector& offsetVector, offset_t begin, offset_t end) {
+    auto& selVector = offsetVector.state->getSelVectorUnsafe();
+    // Read positions from the current view: kept rows are written at or before the row read.
+    const auto positions = selVector.getSelectedPositions();
+    const auto* offsets = reinterpret_cast<const offset_t*>(offsetVector.getData());
+    selVector.setToFiltered();
+    sel_t numKept = 0;
+    for (const auto pos : positions) {
+        if (offsets[pos] >= begin && offsets[pos] < end) {
+            selVector[numKept++] = pos;
+        }
+    }
+    selVector.setSelSize(numKept);
+}
+
 bool IndexLookup::getNextTuplesInternal(ExecutionContext* context) {
-    if (!children[0]->getNextTuple(context)) {
-        return false;
+    while (true) {
+        if (!children[0]->getNextTuple(context)) {
+            return false;
+        }
+        bool filtered = false;
+        for (auto& info : infos) {
+            info.keyEvaluator->evaluate();
+            lookup(transaction::Transaction::Get(*context->clientContext), info);
+            if (info.keepsRange()) {
+                auto& offsetVector = *resultSet->getValueVector(info.resultVectorPos);
+                keepOffsetsInRange(offsetVector, info.keepBegin, info.keepEnd);
+                filtered = true;
+            }
+        }
+        localState->errorHandler->flushStoredErrors();
+        // A bucketed COPY drops most rows: skip chunks it emptied rather than passing them on.
+        if (!filtered || resultSet->getValueVector(infos[0].resultVectorPos)
+                                 ->state->getSelVector()
+                                 .getSelSize() > 0) {
+            return true;
+        }
     }
-    for (auto& info : infos) {
-        info.keyEvaluator->evaluate();
-        lookup(transaction::Transaction::Get(*context->clientContext), info);
-    }
-    localState->errorHandler->flushStoredErrors();
-    return true;
 }
 
 void IndexLookup::initLocalStateInternal(ResultSet* resultSet, ExecutionContext* context) {

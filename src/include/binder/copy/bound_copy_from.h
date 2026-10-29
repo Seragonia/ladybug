@@ -86,6 +86,8 @@ struct ExtraBoundCopyRelInfo final : ExtraBoundCopyFromInfo {
     std::vector<common::RelDataDirection> directions;
     // The input carries node and rel offsets instead of primary keys (COPY option RAW_OFFSETS).
     bool rawOffsets = false;
+    // The rel offset is the third input column (RAW_OFFSETS or REL_OFFSETS).
+    bool inputRelOffsets = false;
 
     ExtraBoundCopyRelInfo(std::string fromTableName, std::string toTableName,
         std::vector<common::idx_t> internalIDColumnIndices, std::vector<IndexLookupInfo> infos)
@@ -94,7 +96,8 @@ struct ExtraBoundCopyRelInfo final : ExtraBoundCopyFromInfo {
     ExtraBoundCopyRelInfo(const ExtraBoundCopyRelInfo& other)
         : fromTableName{other.fromTableName}, toTableName{other.toTableName},
           internalIDColumnIndices{other.internalIDColumnIndices}, infos{other.infos},
-          directions{other.directions}, rawOffsets{other.rawOffsets} {}
+          directions{other.directions}, rawOffsets{other.rawOffsets},
+          inputRelOffsets{other.inputRelOffsets} {}
 
     std::unique_ptr<ExtraBoundCopyFromInfo> copy() const override {
         return std::make_unique<ExtraBoundCopyRelInfo>(*this);

@@ -26,6 +26,8 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapIndexLookup(
         auto offsetPos = DataPos(outSchema->getExpressionPos(*info.offset));
         auto keyEvaluator = exprMapper.getEvaluator(info.key);
         indexLookupInfos.emplace_back(nodeTable, std::move(keyEvaluator), offsetPos);
+        indexLookupInfos.back().keepBegin = info.keepBegin;
+        indexLookupInfos.back().keepEnd = info.keepEnd;
     }
     auto warningDataPos = getDataPos(logicalIndexScan.getInfo(0).warningExprs, *outSchema);
     binder::expression_vector expressions;
